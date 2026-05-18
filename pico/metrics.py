@@ -1222,7 +1222,7 @@ def render_resume_metrics_markdown(metrics):
 
 def render_large_scale_experiment_report(metrics):
     benchmark = metrics["benchmark"]
-    memory_small = metrics["memory_experiment"]
+    memory_small = metrics["memory_base_experiment"]
     memory_large = metrics["memory_large_experiment"]
     context = metrics["context_experiment"]
     security = metrics["security_experiment"]

@@ -759,7 +759,7 @@ class Pico:
 
     def extract_durable_promotions(self, user_message, final_answer):
         user_text = str(user_message or "")
-        if not (DURABLE_MEMORY_INTENT_PATTERN.search(user_text)) or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text):
+        if not (DURABLE_MEMORY_INTENT_PATTERN.search(user_text) or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text)):
             return [],[]
         promotions = []
         rejections = []

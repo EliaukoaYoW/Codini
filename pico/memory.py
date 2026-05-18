@@ -207,7 +207,7 @@ class DurableMemoryStore:
                 }
             )
             existing = topic_notes.setdefault(topic, [])
-            if note_text is existing:
+            if note_text in existing:
                 continue
             new_subject = self._subject_key(note_text)
             replaced = False
