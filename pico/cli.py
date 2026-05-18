@@ -10,9 +10,10 @@ import sys
 import textwrap
 
 from dotenv import load_dotenv
-from models import OpenAICompatibleModelClient, SiliconflowModelClient
-from runtime import Pico, SessionStore
-from workspace import WorkspaceContext, middle
+from .models import OpenAICompatibleModelClient, SiliconflowModelClient
+from .runtime import Pico, SessionStore
+from .sandbox import create_sandbox
+from .workspace import WorkspaceContext, middle
 
 load_dotenv()
 
@@ -121,7 +122,7 @@ def _build_model_client(args):
             base_url=base_url,
             api_key=api_key,
             temperature=args.temperature,
-            timeout=getattr(args, "siliconflow-timeout", getattr(args, "ollama_timeout", 300)),
+            timeout=getattr(args, "siliconflow_timeout", getattr(args, "ollama_timeout", 300)),
         )
     # 待补充 Anthropic Provider 和 Ollama
 
@@ -193,6 +194,11 @@ def build_agent(args):
     workspace = WorkspaceContext.build(args.cwd)
     store = SessionStore(workspace.repo_root + "/.pico/sessions")
     model = _build_model_client(args)
+    sandbox = create_sandbox(
+        kind=args.sandbox,
+        workspace_root=args.cwd,
+        allow_network=args.sandbox_network,
+    )
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
@@ -205,7 +211,8 @@ def build_agent(args):
             approval_policy = args.approval,
             max_steps = args.max_steps,
             max_new_tokens = args.max_new_tokens,
-            secret_env_names = configured_secret_names
+            secret_env_names = configured_secret_names,
+            sandbox = sandbox
         )
     return Pico(
         model_client=model,
@@ -214,7 +221,8 @@ def build_agent(args):
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
-        secret_env_names=configured_secret_names
+        secret_env_names=configured_secret_names,
+        sandbox=sandbox
     )
 
 def build_arg_parser():
@@ -244,6 +252,8 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--sandbox", choices=("none", "bubblewrap"), default="none", help="Sandbox backend for shell execution (default: none).")
+    parser.add_argument("--sandbox-network", action="store_true", default=False, help="Allow network access inside bubblewrap sandbox.")
     return parser
 
 def main(argv = None):
@@ -289,6 +299,15 @@ def main(argv = None):
         if user_input == "/reset":
             agent.reset()
             print("session reset")
+            continue
+        if user_input.startswith("/model"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) == 2:
+                new_model = agent.switch_model(parts[1])
+                print(f"switched to {new_model}")
+            else:
+                current = getattr(agent.model_client, "model", "")
+                print(f"current model: {current}")
             continue
 
         print()

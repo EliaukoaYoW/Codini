@@ -21,6 +21,7 @@ import memory as memorylib
 from context_manager import ContextManager
 from run_store import RunStore
 from task_state import TaskState
+from .sandbox import NoSandbox
 import tools as toolkit
 from workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
@@ -98,7 +99,8 @@ class Pico:
             read_only=False,
             shell_env_allowlist=None,
             secret_env_names=None,
-            feature_flags=None
+            feature_flags=None,
+            sandbox=None
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -116,6 +118,7 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key,value in feature_flags.items()})
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
+        self.sandbox = sandbox or NoSandbox()
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -329,6 +332,13 @@ class Pico:
     def build_tools(self):
         return toolkit.build_tool_registry(self)
 
+    def _sandbox_notes(self):
+        notes = {
+            "none": "The workspace directory is writable. You can read and write files directly.",
+            "bubblewrap": "The workspace directory is mounted into the sandbox. Files you create or modify in the sandbox are visible on the host. System directories like /usr and /etc are read-only. Network access is blocked by default.",
+        }
+        return notes.get(self.sandbox.name, "")
+
     def tool_signature(self):
         """ 计算当前工具的唯一签名 用于在 checkpoint 中检测工具变化 """
         payload = []
@@ -367,9 +377,10 @@ class Pico:
             ]
         )
         # 提示词
+        model_name = getattr(self.model_client, "model", "unknown")
         text = textwrap.dedent(
             """\
-            You are Pico, a small local coding agent working inside a local repository.
+            You are Pico, a small local coding agent powered by {model_name} working inside a local repository.
 
             Rules:
             - Use tools instead of guessing about the workspace.
@@ -389,18 +400,24 @@ class Pico:
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
 
+            Sandbox: shell commands run inside a {sandbox_name} sandbox.
+            {sandbox_notes}
+
             Tools:
             {tool_text}
 
             Valid response examples:
             {examples}
-
+            
             {workspace_text}
             """
         ).format(
+            model_name=model_name,
             tool_text=tool_text,
             examples=examples,
-            workspace_text=self.workspace.text()
+            workspace_text=self.workspace.text(),
+            sandbox_name=self.sandbox.name,
+            sandbox_notes=self._sandbox_notes(),
         ).strip()
 
         return PromptPrefix(
@@ -1337,6 +1354,16 @@ class Pico:
         self.session["memory"].update(memorylib.default_memory_state())
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root = self.root)
         self.session_store.save(self.session)
+
+    def switch_model(self, new_model):
+        """切换当前会话使用的模型名称（同一 provider 内）"""
+        new_model = str(new_model).strip()
+        if not new_model:
+            return getattr(self.model_client, "model", "")
+        self.model_client.model = new_model
+        self.prefix_state = self.build_prefix()
+        self.prefix = self.prefix_state.text
+        return new_model
 
     def path(self, raw_path):
         """ 路径安全解析: 将任意路径标准化成 workspace 内的绝对路径 （防 ../ 逃逸）"""
