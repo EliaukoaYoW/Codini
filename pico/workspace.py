@@ -97,21 +97,27 @@ class WorkspaceContext:
         # 这段文本会被塞进 Prompt Prefix 作为相对稳定的基线上下文
         commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
         docs = "\n".join(f"- {path}\n{snippet}" for path,snippet in self.project_docs.items()) or "- none"
-        return textwrap.dedent(
-            f"""\
+        text = textwrap.dedent(
+            """\
             Workspace:
-            - cwd: {self.cwd}
-            - repo_root: {self.repo_root}
-            - branch: {self.branch}
-            - default_branch: {self.default_branch}
-            - status:
-            {self.status}
-            - recent_commits:
-            {commits}
-            - project_docs:
-            {docs}
+            - cwd: {cwd}
+            - repo_root: {repo_root}
+            - branch: {branch}
+            - default_branch: {default_branch}
+            - status: {status}
+            - recent_commits: {commits}
+            - project_docs: {docs}
             """
+        ).format(
+            cwd=self.cwd,
+            repo_root=self.repo_root,
+            branch=self.branch,
+            default_branch=self.default_branch,
+            status=self.status,
+            commits=commits,
+            docs=docs,
         ).strip()
+        return text
 
     def fingerprint(self):
         """ 生成工作空间的唯一标识符，用于缓存和比较不同工作空间的状态 """
