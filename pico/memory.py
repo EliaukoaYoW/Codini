@@ -527,6 +527,7 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
     query_tokens = _tokenize(query)
     ranked = []
+    # 情景笔记
     for note in state["episodic_notes"]:
         # 召回逻辑故意保持简单透明：先看 tag 精确命中，再看关键词重叠，最后看新旧程度。这里不引入 embedding。
         note_tags = {tag.lower() for tag in note.get("tags", [])}
@@ -537,8 +538,32 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
             continue
         recency = _parse_timestamp(note.get("created_at"))
         ranked.append(((exact_tag_match, keyword_overlap, recency, -1), note))
+        
+    # 搜索 Durable Memory（磁盘上的持久笔记）
+    if workspace_root is not None:
+        durable_root = Path(workspace_root) / ".pico" / "memory"
+        durable_store = DurableMemoryStore(durable_root)
+        for topic in durable_store.load_index():
+            for note in durable_store.load_topic_notes(topic["topic"]):
+                note_tags = {tag.lower() for tag in note.get("tags",[])}
+                note_tokens = _tokenize(note.get("text",""))
+                exact_tag_match = int(bool(query_tokens & note_tags))
+                keyword_overlap = len(query_tokens & note_tokens)
+                if exact_tag_match == 0 and keyword_overlap == 0:
+                    continue
+                recency = _parse_timestamp(note.get("created_at"))
+                ranked.append(((exact_tag_match, keyword_overlap, recency, -1), note))   
     ranked.sort(key=lambda item: item[0], reverse=True)
-    return [note for _, note in ranked[:limit]]
+    
+    seen_texts = set()
+    merged = []
+    for _, note in ranked:
+        text = note.get("text", "")
+        if text in seen_texts:
+            continue
+        seen_texts.add(text)
+        merged.append(note)
+    return merged[:limit]
 
 def retrieval_view(state, query, limit=3, workspace_root=None):
     candidates = retrieval_candidates(state, query, limit = limit, workspace_root = workspace_root)
