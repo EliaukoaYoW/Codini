@@ -1,8 +1,6 @@
-
 import json
 import re
 import time
-from traceback import print_tb
 import urllib.error
 import urllib.request
 from http.client import RemoteDisconnected
