@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-import .memory as memorylib
+from . import memory as memorylib
 from .context_manager import ContextManager
 from .run_store import RunStore
 from .task_state import TaskState

@@ -9,7 +9,7 @@ import subprocess
 import textwrap
 from functools import partial
 
-from workspace import IGNORED_PATH_NAMES, clip
+from .workspace import IGNORED_PATH_NAMES, clip
 
 BASE_TOOL_SPECS = {
     "list_files": {

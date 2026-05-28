@@ -15,7 +15,7 @@ import re
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from workspace import clip, now
+from .workspace import clip, now
 
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
