@@ -112,7 +112,7 @@ class DurableMemoryStore:
                 tags = [tag.strip() for tag in line.split(":", 1)[1].split(",") if tag.strip()]
             elif line.startswith("- updated_at"):
                 updated_at = line.split(":", 1)[1].strip()
-            elif line == " ## Notes":
+            elif line == "## Notes":
                 capture = True
             elif capture and line.startswith("- "):
                 notes.append(
