@@ -1,7 +1,7 @@
-from cli import build_agent, build_arg_parser, build_welcome, main
-from models import AnthropicCompatibleModelClient, FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient,SiliconflowModelClient
-from runtime import MiniAgent, Pico, SessionStore
-from workspace import WorkspaceContext
+from .cli import build_agent, build_arg_parser, build_welcome, main
+from .models import AnthropicCompatibleModelClient, FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient,SiliconflowModelClient
+from .runtime import MiniAgent, Pico, SessionStore
+from .workspace import WorkspaceContext
 
 __all__ = [
     "AnthropicCompatibleModelClient",

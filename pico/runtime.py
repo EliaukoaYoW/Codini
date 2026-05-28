@@ -17,13 +17,13 @@ from datetime import datetime
 from pathlib import Path
 
 
-import memory as memorylib
-from context_manager import ContextManager
-from run_store import RunStore
-from task_state import TaskState
+import .memory as memorylib
+from .context_manager import ContextManager
+from .run_store import RunStore
+from .task_state import TaskState
 from .sandbox import NoSandbox
-import tools as toolkit
-from workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from . import tools as toolkit
+from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
@@ -399,7 +399,12 @@ class Pico:
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
-
+            - If the user asks you to remember, save, or store a fact/decision/preference/convention, you must format it on a new line in your final answer using one of these formats to ensure it is persisted:
+                - Decision: <content> (or 决策：<content>),
+                - Preference: <content> (or 偏好：<content>),
+                - Project convention: <content> (or 项目约定：<content>),
+                - Dependency: <content> (or 依赖：<content>).
+            
             Sandbox: shell commands run inside a {sandbox_name} sandbox.
             {sandbox_notes}
 
@@ -768,10 +773,10 @@ class Pico:
             if not text or REDACTED_VALUE in text:
                 continue
             for topic, pattern in DURABLE_MEMORY_LINE_PATTERNS:
-                math = pattern.match(text)
-                if not math:
+                match = pattern.match(text)
+                if not match:
                     continue
-                note_text = math.group(1).strip()
+                note_text = match.group(1).strip()
                 if note_text:
                     reason = self.reject_durable_reason(note_text)
                     if reason:
