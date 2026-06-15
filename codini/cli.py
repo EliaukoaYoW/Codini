@@ -328,7 +328,8 @@ def main(argv = None):
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OPENAI_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", "")))
     # print(build_welcome(agent, model, host))
-
+    
+    console = Console() if HAS_RICH else None
     print_welcome_rich(agent, model, host)
 
     if args.prompt:
@@ -346,7 +347,8 @@ def main(argv = None):
     while True:
         # 交互模式
         try:
-            user_input = console.input("\n[bold magenta]Codini[/] [bold yellow]>[/] ").strip()
+            if console:
+                user_input = console.input("\n[bold magenta]Codini[/] [bold yellow]>[/] ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0

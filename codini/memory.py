@@ -430,7 +430,7 @@ def normalize_memory_state(state, workspace_root=None):
     state["task"] = working["task_summary"]
     state["files"] = list(working["recent_files"])
     state["notes"] = [note["text"] for note in episodic_notes]
-    durable_root = Path(workspace_root) / ".pico" / "memory" if workspace_root is not None else None
+    durable_root = Path(workspace_root) / ".codini" / "memory" if workspace_root is not None else None
     durable_store = DurableMemoryStore(durable_root) if durable_root is not None else None
     state["durable_topics"] = durable_store.topic_slugs() if durable_store is not None else []
 
@@ -541,7 +541,7 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
         
     # 搜索 Durable Memory（磁盘上的持久笔记）
     if workspace_root is not None:
-        durable_root = Path(workspace_root) / ".pico" / "memory"
+        durable_root = Path(workspace_root) / ".codini" / "memory"
         durable_store = DurableMemoryStore(durable_root)
         for topic in durable_store.load_index():
             for note in durable_store.load_topic_notes(topic["topic"]):
@@ -614,7 +614,7 @@ class LayeredMemory:
         self.workspace_root = workspace_root
         self.state = normalize_memory_state(state, workspace_root)
         self.durable_store = DurableMemoryStore(
-            Path(workspace_root) / ".pico" / "memory") if workspace_root is not None else None
+            Path(workspace_root) / ".codini" / "memory") if workspace_root is not None else None
 
     def to_dict(self):
         self.state = normalize_memory_state(self.state, self.workspace_root)
