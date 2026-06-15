@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from . import memory as memorylib
 from .models import FakeModelClient
-from .runtime import Pico, SessionStore
+from .runtime import Codini, SessionStore
 from .run_store import RunStore
 from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from .workspace import WorkspaceContext
@@ -381,7 +381,7 @@ class BenchmarkEvaluator:
         self.benchmark_path = Path(benchmark_path)
         self.artifact_path = Path(artifact_path)
         self.workspace_root = Path(workspace_root) if workspace_root is not None else Path(
-            tempfile.mkdtemp(prefix="pico-benchmark-")
+            tempfile.mkdtemp(prefix="codini-benchmark-")
         )
         self.model_name = model_name
         self.model_version = model_version
@@ -444,14 +444,14 @@ class BenchmarkEvaluator:
             fixture_copy_root,
             repo_root_override = fixture_copy_root
         )
-        session_store = SessionStore(fixture_copy_root / ".pico" / "sessions")
-        run_store = RunStore(fixture_copy_root / ".pico" / "runs")
+        session_store = SessionStore(fixture_copy_root / ".codini" / "sessions")
+        run_store = RunStore(fixture_copy_root / ".codini" / "runs")
         if self.model_client_factory is not None:
             model_client = self.model_client_factory(task=task, workspace=workspace)
         else:
             model_client = FakeModelClient(_scripted_outputs_for_task(task))
         
-        agent = Pico(
+        agent = Codini(
             model_client=model_client,
             workspace=workspace,
             session_store=session_store,

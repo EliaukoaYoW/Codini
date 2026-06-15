@@ -233,7 +233,7 @@ class OpenAICompatibleModelClient:
         - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
         - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进 `self.last_completion_metadata`
 
-        在 agent 链路里的位置：它位于 `Pico.ask()` 的模型调用阶段，
+        在 agent 链路里的位置：它位于 `Codini.ask()` 的模型调用阶段，
         是稳定前缀缓存复用链路真正落到 provider API 的地方。
         """
         self.last_completion_metadata = {}
