@@ -11,9 +11,25 @@ import textwrap
 
 from dotenv import load_dotenv
 from .models import OpenAICompatibleModelClient, SiliconflowModelClient
-from .runtime import Pico, SessionStore
+from .runtime import Codini, SessionStore
 from .sandbox import create_sandbox
 from .workspace import WorkspaceContext, middle
+
+from .branding import (
+    WELCOME_STATUS,
+    render_mascot_plain_rows,
+    render_mascot_rich_text,
+)
+
+try:
+    from rich.console import Console, Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.rule import Rule
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
 
 load_dotenv()
 
@@ -28,18 +44,9 @@ DEFAULT_SECRET_ENV_NAMES = (
     "GH_PAT"
 )
 
-WELCOME_ART = (
-    "      Hi!",
-    "       /",
-    "   (\"\\(•-•)/\")",
-    "     \\     /",
-    "      o   o",
-    "     (     )",
-    "      \\_T_/",
-)
-WELCOME_NAME = "pico"
+WELCOME_NAME = "Codini"
 WELCOME_SUBTITLE = "local coding agent"
-WELCOME_STATUS = "calm shell, ready for work"
+
 
 HELP_DETAILS = textwrap.dedent(
     """\
@@ -60,7 +67,7 @@ DEFAULT_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 
 
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
-SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
+SECRET_ENV_NAMES_VAR = "Codini_SECRET_ENV_NAMES"
 
 
 
@@ -156,7 +163,8 @@ def build_welcome(agent, model, host):
         return f"| {left}{' ' * gap}{right} |"
 
     line = divider("=")
-    rows = [center(text) for text in WELCOME_ART]
+    mascot_lines = render_mascot_plain_rows(fill="#", blank=" ")
+    rows = [center(text) for text in mascot_lines]
     rows.extend(
         [
             center(WELCOME_NAME),
@@ -172,9 +180,67 @@ def build_welcome(agent, model, host):
     )
     return "\n".join([line, *rows, line])
 
+def print_welcome_rich(agent, model, host):
+    console = Console()
+
+    title_text = Text.assemble(
+        (" Codini ", "bold yellow"),
+        ("v0.1.0", "dim white"),
+        (" │ ", "grey37"),
+        ("Magical Local Coding Agent", "bold magenta"),
+        (" │ ", "grey37"),
+        ("Ready to cast code spells", "italic bright_white")
+    )
+    
+    divider = Rule(style="grey37")
+    
+    env_table = Table.grid(padding=(0, 1))
+    env_table.add_column(style="bold cyan", justify="right", width=12)
+    env_table.add_column(style="bright_white")
+    env_table.add_row("LLM Model", middle(model, 30))
+    env_table.add_row("Provider", middle(host, 30))
+    env_table.add_row("Approval", f"[bold green]{agent.approval_policy}[/]" if agent.approval_policy == "auto" else f"[bold yellow]{agent.approval_policy}[/]")
+    env_table.add_row("Sandbox", f"[bold red]{agent.sandbox.name}[/]" if agent.sandbox.name != "none" else f"[grey50]none (host)[/]")
+    env_table.add_row("Session ID", f"[dim]{agent.session['id']}[/]")
+
+    ws_table = Table.grid(padding=(0, 1))
+    ws_table.add_column(style="bold blue", justify="right", width=12)
+    ws_table.add_column(style="bright_white")
+    ws_table.add_row("Repository", middle(agent.workspace.repo_root, 30))
+    ws_table.add_row("Cwd", middle(agent.workspace.cwd, 30))
+    ws_table.add_row("Branch", f"[bold magenta]{agent.workspace.branch}[/]")
+
+    right_group = Group(
+        Text("⚙️ ENVIR", style="bold green"),
+        env_table,
+        Text("📁 WORKSPACE", style="bold blue"),
+        ws_table
+    )
+
+    mascot_text = render_mascot_rich_text()
+    
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column()
+    grid.add_column()
+    grid.add_row(mascot_text, right_group)
+
+    outer_panel = Panel(
+        Group(
+            title_text,
+            divider,
+            grid
+        ),
+        border_style="grey37",
+        padding=(0, 2),
+        expand=False
+    )
+    
+    console.print()
+    console.print(outer_panel)
+
 def build_agent(args):
     """
-    根据 CLI 参数装配出一个可运行的 Pico 实例。
+    根据 CLI 参数装配出一个可运行的 Codini 实例。
     为什么存在：
     命令行参数只是字符串和开关，runtime 需要的是已经装配好的对象图：
     model client、workspace snapshot、session store、secret 配置等。
@@ -182,17 +248,17 @@ def build_agent(args):
 
     输入 / 输出：
     - 输入：`argparse` 解析后的 `args`
-    - 输出：一个新的 `Pico`，或一个从旧 session 恢复出来的 `Pico`
+    - 输出：一个新的 `Codini`，或一个从旧 session 恢复出来的 `Codini`
 
     在 agent 链路里的位置：
     它是整个程序启动链路里最靠近 runtime 的装配点。`main()` 先调它，
     得到 agent 后，后面无论是 one-shot 还是 REPL 模式，都会落到 `ask()`。
     """
     # 这里是 CLI 到 runtime 的装配点: 先整理 secret 名单，再采集工作区快照，
-    # 随后决定是恢复旧 session 还是创建一个新的 Pico 实例
+    # 随后决定是恢复旧 session 还是创建一个新的 Codini 实例
     configured_secret_names = _configured_secret_names(args)
     workspace = WorkspaceContext.build(args.cwd)
-    store = SessionStore(workspace.repo_root + "/.pico/sessions")
+    store = SessionStore(workspace.repo_root + "/.codini/sessions")
     model = _build_model_client(args)
     sandbox = create_sandbox(
         kind=args.sandbox,
@@ -203,7 +269,7 @@ def build_agent(args):
     if session_id == "latest":
         session_id = store.latest()
     if session_id:
-        return Pico.from_session(
+        return Codini.from_session(
             model_client = model,
             workspace = workspace,
             session_store = store,
@@ -214,7 +280,7 @@ def build_agent(args):
             secret_env_names = configured_secret_names,
             sandbox = sandbox
         )
-    return Pico(
+    return Codini(
         model_client=model,
         workspace=workspace,
         session_store=store,
@@ -261,7 +327,9 @@ def main(argv = None):
     agent = build_agent(args)
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OPENAI_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", "")))
-    print(build_welcome(agent, model, host))
+    # print(build_welcome(agent, model, host))
+
+    print_welcome_rich(agent, model, host)
 
     if args.prompt:
         # 单次会话模式：只跑一次 ask，不进入 REPL 循环
@@ -278,7 +346,7 @@ def main(argv = None):
     while True:
         # 交互模式
         try:
-            user_input = input("\nPico > ").strip()
+            user_input = console.input("\n[bold magenta]Codini[/] [bold yellow]>[/] ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0
