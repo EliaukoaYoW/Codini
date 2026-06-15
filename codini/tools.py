@@ -45,7 +45,7 @@ BASE_TOOL_SPECS = {
     "list_skills": {
         "schema": {},
         "risky": False,
-        "description": "List all available skill documents in the .pico/skills/ directory.",
+        "description": "List all available skill documents in the .codini/skills/ directory.",
     },
     "read_skill": {
         "schema": {"name": "str"},
@@ -279,9 +279,9 @@ def tool_delegate(agent, args):
     if not task:
         raise ValueError("task must not be empty")
     
-    from .runtime import Pico
+    from .runtime import Codini
 
-    child = Pico(
+    child = Codini(
         model_client = agent.model_client,
         workspace = agent.workspace,
         session_store = agent.session_store,
@@ -301,7 +301,7 @@ def tool_delegate(agent, args):
 
 
 def tool_list_skills(agent, args):
-    skills_dir = agent.root / ".pico" / "skills"
+    skills_dir = agent.root / ".codini" / "skills"
     if not skills_dir.exists() or not skills_dir.is_dir():
         return "(no skills available)"
     
@@ -325,7 +325,7 @@ def tool_read_skill(agent, args):
     if skill_name.endswith(".md"):
         skill_name = skill_name[:-3]
         
-    skills_dir = agent.root / ".pico" / "skills"
+    skills_dir = agent.root / ".codini" / "skills"
     
     dir_path = skills_dir / skill_name
     if dir_path.is_dir():

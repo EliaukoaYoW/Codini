@@ -12,7 +12,7 @@ MAX_HISTORY = 12000
 
 # 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+IGNORED_PATH_NAMES = {".git", ".codini", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
 
 def now():
     return datetime.now(timezone.utc).isoformat()
