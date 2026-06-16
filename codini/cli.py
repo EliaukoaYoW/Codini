@@ -21,6 +21,8 @@ from .branding import (
     render_mascot_rich_text,
 )
 
+from .slash import interactive_prompt
+
 try:
     from rich.console import Console, Group
     from rich.panel import Panel
@@ -55,6 +57,7 @@ HELP_DETAILS = textwrap.dedent(
     /memory  Show the agent's distilled working memory.
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
+    /skill   List all available skills or read a specific skill.
     /exit    Exit the agent.
     """
 ).strip()
@@ -69,7 +72,26 @@ DEFAULT_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "Codini_SECRET_ENV_NAMES"
 
+COMMANDS_HELP = {
+    "/help": "Show this help message.",
+    "/memory": "Show the agent's distilled working memory.",
+    "/session": "Show the path to the saved session file.",
+    "/reset": "Clear the current session history and memory.",
+    "/model": "Switch current model or show model.",
+    "/skill": "List all available skills or read a specific skill.",
+    "/exit": "Exit the agent."
+}
 
+COMMON_MODELS = [
+    "deepseek-ai/DeepSeek-R1",
+    "deepseek-ai/DeepSeek-V3.2",
+    "deepseek-ai/DeepSeek-V4",
+    "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-5.4"
+]
 
 def _effective_model(args, provider="openai"):
     explicit_model = getattr(args, "model", None)
@@ -180,7 +202,7 @@ def build_welcome(agent, model, host):
     )
     return "\n".join([line, *rows, line])
 
-def print_welcome_rich(agent, model, host):
+def build_welcome_rich(agent, model, host):
     console = Console()
 
     title_text = Text.assemble(
@@ -202,7 +224,7 @@ def print_welcome_rich(agent, model, host):
     env_table.add_row("Approval", f"[bold green]{agent.approval_policy}[/]" if agent.approval_policy == "auto" else f"[bold yellow]{agent.approval_policy}[/]")
     env_table.add_row("Sandbox", f"[bold red]{agent.sandbox.name}[/]" if agent.sandbox.name != "none" else f"[grey50]none (host)[/]")
     env_table.add_row("Session ID", f"[dim]{agent.session['id']}[/]")
-
+    
     ws_table = Table.grid(padding=(0, 1))
     ws_table.add_column(style="bold blue", justify="right", width=12)
     ws_table.add_column(style="bright_white")
@@ -211,14 +233,14 @@ def print_welcome_rich(agent, model, host):
     ws_table.add_row("Branch", f"[bold magenta]{agent.workspace.branch}[/]")
 
     right_group = Group(
-        Text("⚙️ ENVIR", style="bold green"),
+        Text("ENVIRONMENT", style="bold green"),
         env_table,
-        Text("📁 WORKSPACE", style="bold blue"),
+        Text("WORKSPACE", style="bold green"),
         ws_table
     )
-
-    mascot_text = render_mascot_rich_text()
     
+    mascot_text = render_mascot_rich_text()
+
     grid = Table.grid(padding=(0, 2))
     grid.add_column()
     grid.add_column()
@@ -291,6 +313,22 @@ def build_agent(args):
         sandbox=sandbox
     )
 
+def _get_skills_list(agent):
+    skills_dir = agent.root / ".codini" / "SKILLS"
+    if not skills_dir.exists() or not skills_dir.is_dir():
+        return []
+    skills = []
+    try:
+        for item in skills_dir.iterdir():
+            if item.is_file() and item.name.endswith(".md"):
+                skills.append(item.stem)
+            elif item.is_dir():
+                if (item / "SKILL.md").is_file() or (item / "README.md").is_file():
+                    skills.append(f"{item.name} (package)")
+    except Exception:
+        pass
+    return sorted(skills)
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -330,7 +368,11 @@ def main(argv = None):
     # print(build_welcome(agent, model, host))
     
     console = Console() if HAS_RICH else None
-    print_welcome_rich(agent, model, host)
+
+    if HAS_RICH:
+        build_welcome_rich(agent, model, host)
+    else:
+        build_welcome(agent, model, host)
 
     if args.prompt:
         # 单次会话模式：只跑一次 ask，不进入 REPL 循环
@@ -344,18 +386,34 @@ def main(argv = None):
                 return 1
         return 0
 
+    # 初始化历史记录
+    history = []
+
     while True:
         # 交互模式
         try:
-            if console:
+            if sys.stdin.isatty():
+                skills = _get_skills_list(agent)
+                user_input = interactive_prompt(
+                    prompt_text="\n\033[1;35mCodini\033[0m \033[1;33m>\033[0m ",
+                    commands_help=COMMANDS_HELP,
+                    common_models=COMMON_MODELS,
+                    history=history,
+                    skills=skills
+                ).strip()
+            elif HAS_RICH and console:
                 user_input = console.input("\n[bold magenta]Codini[/] [bold yellow]>[/] ").strip()
+            else:
+                user_input = input("\nCodini -> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0
 
         if not user_input:
             continue
-        if user_input in {"/exit", "/quit"}:
+        if not history or history[-1] != user_input:
+            history.append(user_input)
+        if user_input in {"/exit"}:
             return 0
         if user_input == "/help":
             print(HELP_DETAILS)
@@ -379,7 +437,20 @@ def main(argv = None):
                 current = getattr(agent.model_client, "model", "")
                 print(f"current model: {current}")
             continue
-
+        if user_input.startswith("/skill"):
+            from .tools import tool_list_skills, tool_read_skill
+            parts = user_input.split(maxsplit=1)
+            if len(parts) == 2:
+                skill_name = parts[1].strip()
+                try:
+                    result = tool_read_skill(agent, {"name": skill_name})
+                    print(result)
+                except ValueError as exc:
+                    print(str(exc), file=sys.stderr)
+            else:
+                result = tool_list_skills(agent, {})
+                print(result)
+            continue
         print()
         try:
             result = agent.ask(user_input)
