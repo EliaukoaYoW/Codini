@@ -65,7 +65,7 @@ HELP_DETAILS = textwrap.dedent(
 DEFAULT_OPENAI_MODEL = "gpt-5.4"
 DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
 
-DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3.2"
+DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 DEFAULT_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 
 
@@ -85,12 +85,13 @@ COMMANDS_HELP = {
 COMMON_MODELS = [
     "deepseek-ai/DeepSeek-R1",
     "deepseek-ai/DeepSeek-V3.2",
-    "deepseek-ai/DeepSeek-V4",
-    "Qwen/Qwen2.5-Coder-7B-Instruct",
-    "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "gpt-4o",
-    "gpt-4o-mini",
+    "deepseek-ai/DeepSeek-V4-Flash",
+    "gpt-5.5",
     "gpt-5.4"
+    "Qwen/Qwen3.7-Plus",
+    "MiniMaxAI/MiniMax-M2.5",
+    "moonshotai/Kimi-K2.7-Code",
+    "zai-org/GLM-5.2",
 ]
 
 def _effective_model(args, provider="openai"):

@@ -202,6 +202,7 @@ def interactive_prompt(prompt_text, commands_help, common_models, history=None, 
         os.system("")
 
     current_text = ""
+    draft_text = ""       # 保存用户进入历史浏览前正在输入的草稿
     selected_idx = -1
     prev_lines_count = 0
     history_idx = len(history)
@@ -234,6 +235,9 @@ def interactive_prompt(prompt_text, commands_help, common_models, history=None, 
                     selected_idx = (selected_idx - 1) % len(matches)
             else:
                 if history and history_idx > 0:
+                    # 首次离开末尾位置时，保存当前输入为草稿
+                    if history_idx == len(history):
+                        draft_text = current_text
                     history_idx -= 1
                     current_text = history[history_idx]
                     selected_idx = -1
@@ -249,15 +253,17 @@ def interactive_prompt(prompt_text, commands_help, common_models, history=None, 
                     history_idx += 1
                     current_text = history[history_idx]
                     selected_idx = -1
-                elif history_idx == len(history) - 1:
+                elif history and history_idx == len(history) - 1:
+                    # 回到末尾，恢复用户之前的草稿输入
                     history_idx = len(history)
-                    current_text = ""
+                    current_text = draft_text
                     selected_idx = -1
         elif key == 'backspace':
             if current_text:
                 current_text = current_text[:-1]
             selected_idx = -1
             history_idx = len(history)
+            draft_text = current_text  # 实时同步草稿
         elif key == 'tab':
             matches = get_matches(current_text, commands_help, common_models, skills)
             if matches:
@@ -272,7 +278,7 @@ def interactive_prompt(prompt_text, commands_help, common_models, history=None, 
             matches = get_matches(current_text, commands_help, common_models, skills)
             if matches and selected_idx != -1:
                 completed = matches[selected_idx][0]
-                if completed in {"/help", "/memory", "/session", "/reset", "/exit"}:
+                if completed in {"/help", "/memory", "/session", "/reset", "/exit", "/quit"}:
                     current_text = completed
                     break
                 else:
@@ -287,6 +293,7 @@ def interactive_prompt(prompt_text, commands_help, common_models, history=None, 
             current_text += key
             selected_idx = -1
             history_idx = len(history)
+            draft_text = current_text  # 实时同步草稿
 
         matches = get_matches(current_text, commands_help, common_models, skills)
         prev_lines_count = draw_interface(prompt_text, current_text, matches, selected_idx, prev_lines_count)
