@@ -11,20 +11,20 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_TOTAL_BUDGET = 12000  # 整个 Prompt 允许的最大字符数
+DEFAULT_TOTAL_BUDGET = 25000  # 整个 Prompt 允许的最大字符数
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,          # 系统指令 + 工作区快照
-    "memory": 1600,          # 工作记忆（任务摘要 + 最近读过的文件）
-    "relevant_memory": 1200, # 根据当前请求召回的相关历史笔记
-    "history": 5200          # 本次会话的历史记录
+    "prefix": 6000,          # 系统指令 + 工作区快照
+    "memory": 3000,          # 工作记忆（任务摘要 + 最近读过的文件）
+    "relevant_memory": 2500, # 根据当前请求召回的相关历史笔记
+    "history": 12500          # 本次会话的历史记录
 }
 
 # 每个部分的最小预算，防止模型输出为空
 DEFAULT_SECTION_FLOORS = {
-    "prefix": 1200,
-    "memory": 400,
-    "relevant_memory": 300,
-    "history": 1500
+    "prefix": 2400,
+    "memory": 800,
+    "relevant_memory": 600,
+    "history": 3000
 }
 # 当 Prompt 超预算时的压缩顺序
 DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
@@ -493,8 +493,8 @@ class ContextManager:
         lines = []
         for item in history:
             if item["role"] == "tool":
-                lines.append(f"[assistant] <tool>{{\"name\":\"{item['name']}\",\"args\":{json.dumps(item['args'], sort_keys=True)}}}</tool>")
-                lines.append(f"[system] Tool result:\n{item['content']}")
+                lines.append(f"[assistant]: <tool>{{\"name\":\"{item['name']}\",\"args\":{json.dumps(item['args'], sort_keys=True)}}}</tool>")
+                lines.append(f"[system]: <tool_result>:\n{item['content']}\n<tool_result>")
             else:
                 lines.append(f"[{item['role']}] {item['content']}")
         return "\n".join(["Transcript:", *lines])

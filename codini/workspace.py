@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_TOOL_OUTPUT = 4000
-MAX_HISTORY = 12000
+MAX_HISTORY = 25000
 
 # 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
