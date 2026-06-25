@@ -29,6 +29,7 @@ try:
     from rich.table import Table
     from rich.text import Text
     from rich.rule import Rule
+    from rich import box
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
@@ -54,10 +55,15 @@ HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
     /help    Show this help message.
+    /clear   Create a new empty session.
+    /compact Compact older session history.
+    /context Show prompt context usage.
+    /dream   Consolidate durable memory.
     /memory  Show the agent's distilled working memory.
-    /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
     /skill   List all available skills or read a specific skill.
+    /session Show the path to the saved session file.
+    /agents  Show subagent worker status.
     /exit    Exit the agent.
     """
 ).strip()
@@ -74,10 +80,11 @@ SECRET_ENV_NAMES_VAR = "Codini_SECRET_ENV_NAMES"
 
 COMMANDS_HELP = {
     "/help": "Show this help message.",
+    "/context": "Show prompt context usage.",
+    "/model": "Switch current model or show model.",
     "/memory": "Show the agent's distilled working memory.",
     "/session": "Show the path to the saved session file.",
     "/reset": "Clear the current session history and memory.",
-    "/model": "Switch current model or show model.",
     "/skill": "List all available skills or read a specific skill.",
     "/exit": "Exit the agent."
 }
@@ -87,7 +94,7 @@ COMMON_MODELS = [
     "deepseek-ai/DeepSeek-V3.2",
     "deepseek-ai/DeepSeek-V4-Flash",
     "gpt-5.5",
-    "gpt-5.4"
+    "gpt-5.4",
     "Qwen/Qwen3.7-Plus",
     "MiniMaxAI/MiniMax-M2.5",
     "moonshotai/Kimi-K2.7-Code",
@@ -156,8 +163,6 @@ def _build_model_client(args):
         )
     # 待补充 Anthropic Provider 和 Ollama
 
-
-
 def build_welcome(agent, model, host):
     width = max(68, min(shutil.get_terminal_size((80, 20)).columns, 84))
     inner = width - 4
@@ -210,7 +215,7 @@ def build_welcome_rich(agent, model, host):
         (" Codini ", "bold yellow"),
         ("v0.1.0", "dim white"),
         (" │ ", "grey37"),
-        ("Magical Local Coding Agent", "bold magenta"),
+        ("Magical Local Harness Agent", "bold magenta"),
         (" │ ", "grey37"),
         ("Ready to cast code spells", "italic bright_white")
     )
@@ -260,6 +265,66 @@ def build_welcome_rich(agent, model, host):
     
     console.print()
     console.print(outer_panel)
+
+def build_context_usage(metadata):
+    console = Console()
+    table = Table(title="📊 Prompt Context Usage", title_style="bold magenta", border_style="grey37", box=box.ROUNDED)
+    table.add_column("Section", style="cyan")
+    table.add_column("Raw Size (Chars)", justify="right")
+    table.add_column("Budget Allocated", justify="right")
+    table.add_column("Final Rendered (Chars)", justify="right")
+    table.add_column("Usage %", justify="right")
+
+    sections = metadata.get("sections", {})
+    section_order = metadata.get("section_order", [])
+
+    for section in section_order:
+        sec_data = sections.get(section, {})
+        raw = sec_data.get("raw_chars", 0)
+        budget = sec_data.get("budget_chars")
+        rendered = sec_data.get("rendered_chars", 0)
+        
+        budget_str = str(budget) if budget is not None else "-"
+        
+        if budget is not None and budget > 0:
+            pct = (rendered / budget) * 100
+            pct_str = f"{pct:.1f}%"
+            if pct > 100:
+                pct_str = f"[bold red]{pct_str}[/]"
+            elif pct > 80:
+                pct_str = f"[bold yellow]{pct_str}[/]"
+            else:
+                pct_str = f"[bold green]{pct_str}[/]"
+        else:
+            pct_str = "-"
+        
+        # Highlight if truncated
+        rendered_display = str(rendered)
+        if raw > rendered:
+            rendered_display = f"[bold yellow]{rendered} (truncated)[/]"
+            
+        table.add_row(section, str(raw), budget_str, rendered_display, pct_str)
+
+    console.print(table)
+    
+    total_used = metadata.get("prompt_chars", 0)
+    total_budget = metadata.get("prompt_budget_chars", 0)
+    total_pct = (total_used / total_budget) * 100
+    
+    total_pct_str = f"{total_pct:.1f}%"
+    if total_used > total_budget:
+        status_str = f"[bold red]OVER BUDGET {total_pct_str}[/]"
+    else:
+        status_str = f"[bold green]OK {total_pct_str}[/]"
+        
+    console.print(f"Total Prompt Size: [bold]{total_used}[/] / {total_budget} chars ({status_str})")
+    
+    reductions = metadata.get("budget_reductions", [])
+    if reductions:
+        console.print("\n[bold yellow]Budget Reductions Applied:[/]")
+        for red in reductions:
+            console.print(f"  • [cyan]{red['section']}[/]: {red['before_chars']} -> {red['after_chars']} (overflow: {red['overflow_chars']} chars)")
+    print()
 
 def build_agent(args):
     """
@@ -315,7 +380,7 @@ def build_agent(args):
     )
 
 def _get_skills_list(agent):
-    skills_dir = agent.root / ".codini" / "SKILLS"
+    skills_dir = agent.root / ".codini" / "skills"
     if not skills_dir.exists() or not skills_dir.is_dir():
         return []
     skills = []
@@ -325,7 +390,7 @@ def _get_skills_list(agent):
                 skills.append(item.stem)
             elif item.is_dir():
                 if (item / "SKILL.md").is_file() or (item / "README.md").is_file():
-                    skills.append(f"{item.name} (package)")
+                    skills.append(f"{item.name}")
     except Exception:
         pass
     return sorted(skills)
@@ -419,15 +484,15 @@ def main(argv = None):
         if user_input == "/help":
             print(HELP_DETAILS)
             continue
+        if user_input == "/context":
+            try:
+                _, metadata = agent.context_manager.build("")
+                build_context_usage(metadata)
+            except Exception as e:
+                print(f"Error calculating context: {e}", file=sys.stderr)
+            continue
         if user_input == "/memory":
             print(agent.memory_text())
-            continue
-        if user_input == "/session":
-            print(agent.session_path)
-            continue
-        if user_input == "/reset":
-            agent.reset()
-            print("session reset")
             continue
         if user_input.startswith("/model"):
             parts = user_input.split(maxsplit=1)
@@ -437,6 +502,13 @@ def main(argv = None):
             else:
                 current = getattr(agent.model_client, "model", "")
                 print(f"current model: {current}")
+            continue
+        if user_input == "/reset":
+            agent.reset()
+            print("session reset")
+            continue
+        if user_input == "/session":
+            print(agent.session_path)
             continue
         if user_input.startswith("/skill"):
             from .tools import tool_list_skills, tool_read_skill
