@@ -21,13 +21,28 @@ def get_key_win():
 
     def read_char():
         if is_pipe:
-            # 管道模式下，使用 ReadFile 读取单个字节以规避 line buffer 阻碍
+            # 管道模式下，逐字节读取并按 UTF-8 多字节规则重组字符（中文占 3 字节）
             buf = ctypes.create_string_buffer(1)
             read = wintypes.DWORD()
             res = kernel32.ReadFile(h_stdin, buf, 1, ctypes.byref(read), None)
-            if res and read.value > 0:
-                return buf.raw[0:1].decode('utf-8', errors='ignore')
-            return ''
+            if not (res and read.value > 0):
+                return ''
+            first_byte = buf.raw[0]
+            # 根据 UTF-8 首字节确定总字节数
+            if first_byte < 0x80:
+                total = 1
+            elif first_byte < 0xE0:
+                total = 2
+            elif first_byte < 0xF0:
+                total = 3
+            else:
+                total = 4
+            raw = bytes([first_byte])
+            for _ in range(total - 1):
+                res2 = kernel32.ReadFile(h_stdin, buf, 1, ctypes.byref(read), None)
+                if res2 and read.value > 0:
+                    raw += buf.raw[0:1]
+            return raw.decode('utf-8', errors='replace')
         else:
             # 标准 CMD/PowerShell 模式下使用 getwch
             return msvcrt.getwch()
@@ -93,7 +108,22 @@ def get_key_unix():
         b = os.read(fd, 1)
         if not b:
             return None
-        ch = b.decode('utf-8', errors='ignore')
+        first_byte = b[0]
+        # 根据 UTF-8 首字节确定总字节数（中文占 3 字节，emoji 占 4 字节）
+        if first_byte < 0x80:
+            total = 1
+        elif first_byte < 0xE0:
+            total = 2
+        elif first_byte < 0xF0:
+            total = 3
+        else:
+            total = 4
+        raw = b
+        for _ in range(total - 1):
+            extra = os.read(fd, 1)
+            if extra:
+                raw += extra
+        ch = raw.decode('utf-8', errors='replace')
         if ch == '\x1b':
             # 检测缓冲区中是否存在后续转义序列字节
             r, _, _ = select.select([fd], [], [], 0.05)
@@ -123,19 +153,9 @@ def get_key_unix():
 def get_matches(current_text, commands_help, common_models, skills=None):
     if not current_text.startswith('/'):
         return []
-    if current_text.startswith('/model '):
-        prefix = current_text[len('/model '):]
-        return [(f"/model {m}", f"Switch to {m}") for m in common_models if m.startswith(prefix)]
-    elif current_text == '/model':
-        return [('/model', commands_help['/model'])]
-    elif current_text.startswith('/skill '):
-        if not skills:
-            return []
-        prefix = current_text[len('/skill '):]
-        prefix_lower = prefix.lower()
-        return [(f"/skill {s}", f"Read skill {s}") for s in skills if prefix_lower in s.lower()]
-    elif current_text == '/skill':
-        return [('/skill', commands_help['/skill'])]
+    # 如果包含空格（表明已经输入了命令参数，例如已选定 "/model " 或 "/skill "），不再显示下拉的 Box UI
+    if ' ' in current_text:
+        return []
     return [(cmd, desc) for cmd, desc in commands_help.items() if cmd.startswith(current_text)]
 
 
@@ -188,11 +208,75 @@ def draw_interface(prompt, current_text, matches, selected_idx, prev_lines_count
     return lines_printed
 
 
+class RawModeUnix:
+    def __enter__(self):
+        import tty
+        import termios
+        self.fd = sys.stdin.fileno()
+        self.old_settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, type, value, traceback):
+        import termios
+        if self.old_settings:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+
+class RawModeWin:
+    def __enter__(self):
+        return self
+    def __exit__(self, type, value, traceback):
+        pass
+
+
+def read_key_raw_unix(fd):
+    import select
+    b = os.read(fd, 1)
+    if not b:
+        return None
+    first_byte = b[0]
+    if first_byte < 0x80:
+        total = 1
+    elif first_byte < 0xE0:
+        total = 2
+    elif first_byte < 0xF0:
+        total = 3
+    else:
+        total = 4
+    raw = b
+    for _ in range(total - 1):
+        extra = os.read(fd, 1)
+        if extra:
+            raw += extra
+    ch = raw.decode('utf-8', errors='replace')
+    if ch == '\x1b':
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            b2 = os.read(fd, 1)
+            ch2 = b2.decode('utf-8', errors='ignore')
+            if ch2 == '[':
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if r:
+                    b3 = os.read(fd, 1)
+                    ch3 = b3.decode('utf-8', errors='ignore')
+                    if ch3 == 'A': return 'up'
+                    if ch3 == 'B': return 'down'
+                    if ch3 == 'C': return 'right'
+                    if ch3 == 'D': return 'left'
+        return 'escape'
+    if ch in ('\r', '\n'): return 'enter'
+    if ch == '\t': return 'tab'
+    if ch in ('\x7f', '\x08'): return 'backspace'
+    if ch == '\x03': raise KeyboardInterrupt
+    if ch == '\x04': raise EOFError
+    return ch
+
+
 def interactive_prompt(prompt_text, commands_help, common_models, history=None, skills=None):
     if history is None:
         history = []
 
-    # 提取并分离提示符开头的换行符，防止每次重绘时屏幕都下移一行
     if prompt_text.startswith("\n"):
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -201,104 +285,231 @@ def interactive_prompt(prompt_text, commands_help, common_models, history=None, 
     if sys.platform == "win32":
         os.system("")
 
-    current_text = ""
-    draft_text = ""       # 保存用户进入历史浏览前正在输入的草稿
+    import unicodedata
+
+    def _char_width(ch):
+        """计算字符的终端显示宽度（中文/全角 = 2，其他 = 1）"""
+        if unicodedata.east_asian_width(ch) in ('F', 'W'):
+            return 2
+        return 1
+
+    def _str_width(s):
+        """计算字符串的终端显示宽度"""
+        return sum(_char_width(c) for c in s)
+
+    chars = []
+    cursor_pos = 0
+    draft_text = ""
     selected_idx = -1
     prev_lines_count = 0
     history_idx = len(history)
+    slash_mode = False
 
-    matches = []
-    prev_lines_count = draw_interface(prompt_text, current_text, matches, selected_idx, prev_lines_count)
-
-    while True:
-        try:
-            if sys.platform == "win32":
-                key = get_key_win()
-            else:
-                key = get_key_unix()
-        except (KeyboardInterrupt, EOFError) as e:
-            # 清理下拉菜单并定位
-            write_stdout("\r\033[J")
-            write_stdout(f"{prompt_text}{current_text}\n")
+    def draw_current_state():
+        nonlocal prev_lines_count
+        current_text = "".join(chars)
+        if slash_mode:
+            matches = get_matches(current_text, commands_help, common_models, skills)
+            prev_lines_count = draw_interface(prompt_text, current_text, matches, selected_idx, prev_lines_count)
+            move_left = _str_width(current_text[cursor_pos:])
+            if move_left > 0:
+                write_stdout(f"\033[{move_left}D")
+                sys.stdout.flush()
+        else:
+            # 清理下拉菜单并重绘正常行
+            if prev_lines_count > 0:
+                write_stdout("\r\033[J")
+                prev_lines_count = 0
+            
+            write_stdout(f"\r\033[K{prompt_text}{current_text}")
+            move_left = _str_width(current_text[cursor_pos:])
+            if move_left > 0:
+                write_stdout(f"\033[{move_left}D")
             sys.stdout.flush()
-            raise e
 
-        if key is None:
-            continue
+    # 画初始空行
+    draw_current_state()
 
-        if key == 'up':
-            matches = get_matches(current_text, commands_help, common_models, skills)
-            if matches:
-                if selected_idx == -1:
-                    selected_idx = len(matches) - 1
+    # 确定原始 raw 模式上下文管理器
+    if sys.platform == "win32":
+        raw_mode_ctx = RawModeWin()
+        fd = None
+    else:
+        raw_mode_ctx = RawModeUnix()
+        fd = sys.stdin.fileno()
+
+    def has_input():
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.windll.kernel32
+                h_stdin = kernel32.GetStdHandle(-10)
+                avail = wintypes.DWORD()
+                res = kernel32.PeekNamedPipe(h_stdin, None, 0, None, ctypes.byref(avail), None)
+                return res and avail.value > 0
+            except Exception:
+                return False
+        else:
+            import select
+            try:
+                r, _, _ = select.select([fd], [], [], 0)
+                return bool(r)
+            except Exception:
+                return False
+
+    pending_keys = []
+
+    try:
+        with raw_mode_ctx:
+            while True:
+                if pending_keys:
+                    key = pending_keys.pop(0)
                 else:
-                    selected_idx = (selected_idx - 1) % len(matches)
-            else:
-                if history and history_idx > 0:
-                    # 首次离开末尾位置时，保存当前输入为草稿
-                    if history_idx == len(history):
-                        draft_text = current_text
-                    history_idx -= 1
-                    current_text = history[history_idx]
-                    selected_idx = -1
-        elif key == 'down':
-            matches = get_matches(current_text, commands_help, common_models, skills)
-            if matches:
-                if selected_idx == -1:
-                    selected_idx = 0
-                else:
-                    selected_idx = (selected_idx + 1) % len(matches)
-            else:
-                if history and history_idx < len(history) - 1:
-                    history_idx += 1
-                    current_text = history[history_idx]
-                    selected_idx = -1
-                elif history and history_idx == len(history) - 1:
-                    # 回到末尾，恢复用户之前的草稿输入
-                    history_idx = len(history)
-                    current_text = draft_text
-                    selected_idx = -1
-        elif key == 'backspace':
-            if current_text:
-                current_text = current_text[:-1]
-            selected_idx = -1
-            history_idx = len(history)
-            draft_text = current_text  # 实时同步草稿
-        elif key == 'tab':
-            matches = get_matches(current_text, commands_help, common_models, skills)
-            if matches:
-                idx = selected_idx if selected_idx != -1 else 0
-                completed = matches[idx][0]
-                if completed in {"/model", "/skill"}:
-                    current_text = completed + " "
-                else:
-                    current_text = completed
-                selected_idx = -1
-        elif key == 'enter':
-            matches = get_matches(current_text, commands_help, common_models, skills)
-            if matches and selected_idx != -1:
-                completed = matches[selected_idx][0]
-                if completed in {"/help", "/memory", "/session", "/reset", "/exit", "/quit"}:
-                    current_text = completed
-                    break
-                else:
-                    if completed in {"/model", "/skill"}:
-                        current_text = completed + " "
+                    if sys.platform == "win32":
+                        key = get_key_win()
                     else:
-                        current_text = completed
-                    selected_idx = -1
-            else:
-                break
-        elif len(key) == 1:
-            current_text += key
-            selected_idx = -1
-            history_idx = len(history)
-            draft_text = current_text  # 实时同步草稿
+                        key = read_key_raw_unix(fd)
 
-        matches = get_matches(current_text, commands_help, common_models, skills)
-        prev_lines_count = draw_interface(prompt_text, current_text, matches, selected_idx, prev_lines_count)
+                if key is None:
+                    continue
 
-    # 退出前清理下拉菜单，只保留输入行
+                # 连续输入与粘贴优化
+                if key not in ('up', 'down', 'left', 'right', 'enter', 'tab', 'backspace', 'escape'):
+                    while has_input():
+                        if sys.platform == "win32":
+                            next_key = get_key_win()
+                        else:
+                            next_key = read_key_raw_unix(fd)
+                        if next_key is None:
+                            continue
+                        if next_key in ('up', 'down', 'left', 'right', 'enter', 'tab', 'backspace', 'escape'):
+                            pending_keys.append(next_key)
+                            break
+                        key += next_key
+
+                if key == 'enter':
+                    break
+
+                elif key == 'backspace':
+                    if cursor_pos > 0:
+                        chars.pop(cursor_pos - 1)
+                        cursor_pos -= 1
+                        
+                        current_text = "".join(chars)
+                        was_slash = slash_mode
+                        slash_mode = current_text.startswith('/')
+                        
+                        if was_slash and not slash_mode:
+                            selected_idx = -1
+                            history_idx = len(history)
+                            draft_text = ""
+                        
+                        draw_current_state()
+                    continue
+
+                elif key == 'left':
+                    if cursor_pos > 0:
+                        cursor_pos -= 1
+                        draw_current_state()
+                    continue
+
+                elif key == 'right':
+                    if cursor_pos < len(chars):
+                        cursor_pos += 1
+                        draw_current_state()
+                    continue
+
+                elif key == 'up':
+                    current_text = "".join(chars)
+                    matches = get_matches(current_text, commands_help, common_models, skills)
+                    if slash_mode and matches:
+                        if selected_idx == -1:
+                            selected_idx = len(matches) - 1
+                        else:
+                            selected_idx = (selected_idx - 1) % len(matches)
+                    else:
+                        if history and history_idx > 0:
+                            if history_idx == len(history):
+                                draft_text = current_text
+                            history_idx -= 1
+                            chars = list(history[history_idx])
+                            cursor_pos = len(chars)
+                            slash_mode = history[history_idx].startswith('/')
+                            selected_idx = -1
+                    draw_current_state()
+                    continue
+
+                elif key == 'down':
+                    current_text = "".join(chars)
+                    matches = get_matches(current_text, commands_help, common_models, skills)
+                    if slash_mode and matches:
+                        if selected_idx == -1:
+                            selected_idx = 0
+                        else:
+                            selected_idx = (selected_idx + 1) % len(matches)
+                    else:
+                        if history and history_idx < len(history) - 1:
+                            history_idx += 1
+                            chars = list(history[history_idx])
+                            cursor_pos = len(chars)
+                            slash_mode = history[history_idx].startswith('/')
+                            selected_idx = -1
+                        elif history and history_idx == len(history) - 1:
+                            history_idx = len(history)
+                            chars = list(draft_text)
+                            cursor_pos = len(chars)
+                            slash_mode = draft_text.startswith('/')
+                            selected_idx = -1
+                    draw_current_state()
+                    continue
+
+                elif key == 'tab':
+                    if slash_mode:
+                        current_text = "".join(chars)
+                        matches = get_matches(current_text, commands_help, common_models, skills)
+                        if matches:
+                            idx = selected_idx if selected_idx != -1 else 0
+                            completed = matches[idx][0]
+                            if completed in {"/model", "/skill"}:
+                                chars = list(completed + " ")
+                            else:
+                                chars = list(completed)
+                            cursor_pos = len(chars)
+                            selected_idx = -1
+                            draw_current_state()
+                    continue
+
+                elif key == 'escape':
+                    draw_current_state()
+                    continue
+
+                elif len(key) >= 1:
+                    # 在光标处插入字符
+                    for c in key:
+                        chars.insert(cursor_pos, c)
+                        cursor_pos += 1
+                    
+                    current_text = "".join(chars)
+                    was_slash = slash_mode
+                    slash_mode = current_text.startswith('/')
+                    
+                    if slash_mode and not was_slash:
+                        selected_idx = -1
+                        history_idx = len(history)
+                        draft_text = current_text
+                    
+                    draw_current_state()
+                    continue
+
+    except (KeyboardInterrupt, EOFError) as e:
+        current_text = "".join(chars)
+        write_stdout("\r\033[J")
+        write_stdout(f"{prompt_text}{current_text}\n")
+        sys.stdout.flush()
+        raise e
+
+    current_text = "".join(chars)
     write_stdout("\r\033[J")
     write_stdout(f"{prompt_text}{current_text}\n")
     sys.stdout.flush()
