@@ -452,8 +452,14 @@ def main(argv = None):
                 return 1
         return 0
 
-    # 初始化历史记录
+    # 初始化历史记录，如果从已有会话恢复则导入之前的用户输入历史
     history = []
+    if agent.session and "history" in agent.session:
+        for item in agent.session["history"]:
+            if isinstance(item, dict) and item.get("role") == "user":
+                content = item.get("content")
+                if content and (not history or history[-1] != content):
+                    history.append(content)
 
     while True:
         # 交互模式
