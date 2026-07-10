@@ -401,10 +401,10 @@ class ContextManager:
     def _compressed_history_entries(self, history: list[dict[str, Any]], recent_start: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
         """
         将历史条目分成「最近」和「较旧」两类，分别处理:
-        - 最近条目：保留完整内容（每条最多 900 字符）
+        - 最近条目：保留完整内容（每条最多 10000 字符）
         - 较旧的 read_file：用记忆中的文件摘要替代，重复的直接丢弃
         - 较旧的其他工具：压缩成一行摘要
-        - 较旧的用户/助手消息：压缩到 60 字符
+        - 较旧的用户/助手消息：压缩到 500 字符
         输入: history（历史记录列表）、recent_start（最近记录起始索引）
         输出: 压缩后的历史记录列表 entries、压缩详情 details
         """
@@ -420,7 +420,7 @@ class ContextManager:
         for index, item in enumerate(history):
             recent = index >= recent_start
             if recent:
-                line_limit = 900
+                line_limit = 10000
                 entries.append(
                     {
                         "recent": True,
@@ -448,7 +448,7 @@ class ContextManager:
                 details["summarized_tool_count"] += 1
                 continue
             
-            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
+            entries.append({"recent": False, "lines": self._render_history_item(item, 500)})
         return entries, details
     
 
@@ -510,8 +510,22 @@ class ContextManager:
             prefix = f"[assistant] <tool>{{\"name\":\"{item['name']}\",\"args\":{json.dumps(item['args'], sort_keys=True)}}}</tool>"
             content = f"[system] Tool result:\n{_tail_clip(item['content'], max(20, line_limit))}"
             return [prefix, content]
-        return [f"[{item['role']}] {_tail_clip(item['content'], line_limit)}"]
-    
+
+        content = item.get("content", "")
+        if item["role"] == "assistant":
+            cleaned = []
+            for line in content.splitlines():
+                stripped = line.strip()
+                if any(stripped.startswith(prefix) for prefix in (
+                    "STATUS:", "STEPS_USED:", "FINDINGS:",
+                    "Sub-agent status:", "Steps used:", "Findings:"
+                )):
+                    continue
+                cleaned.append(line)
+            content = "\n".join(cleaned)
+            
+        return [f"[{item['role']}] {_tail_clip(content, line_limit)}"]
+
     def _assemble_prompt(self, rendered: dict[str, SectionRender]) -> str:
         # 组装Prompt 其顺序是刻意设计的：稳定规则放前面，最新请求放最后。
         return "\n\n".join(
