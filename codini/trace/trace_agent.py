@@ -246,8 +246,17 @@ class RichTrace(TraceHooks):
         if self._corrections:
             parts.append(f"[dim]⚠[/] {self._corrections} corrections")
 
+        stats_text = "  │  ".join(parts)
         self.console.print()
-        self.console.print("  " + "  │  ".join(parts))
+        self.console.print(
+            Panel(
+                stats_text,
+                border_style=COLOR_DIM,
+                box=box.ROUNDED,
+                padding=(0, 1),
+                expand=False,
+            )
+        )
 
     def on_run_error(self, error: str) -> None:
         self.console.print()
