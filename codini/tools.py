@@ -343,7 +343,7 @@ def tool_delegate(agent, args):
         secret_env_names=agent.secret_env_names,
         shell_env_allowlist=agent.shell_env_allowlist,
         session=child_session,
-        viz=SubAgentViz(agent.viz) if agent.viz else None,
+        trace=SubAgentTrace(agent.trace) if agent.trace else None,
     )
     # 把父 run 信息显式灌进子 agent 属性，等子 ask() 启动时会复制给子 task_state
     child.parent_run_id = parent_run_id
