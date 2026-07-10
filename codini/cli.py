@@ -535,9 +535,7 @@ def main(argv = None):
                 print(result)
             continue
         try:
-            result = agent.ask(user_input)
-            for char in result:
-                print(char, end="", flush=True)
+            agent.ask(user_input)
         except KeyboardInterrupt:
             print("\n[interrupted]")
             continue
