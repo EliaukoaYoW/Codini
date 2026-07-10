@@ -12,7 +12,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-from .hooks import VizHooks
+from .hooks import TraceHooks
 
 TOOL_ICONS = {
     "read_file": "📖",
