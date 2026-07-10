@@ -84,7 +84,7 @@ class RunStore:
         return path
     
     def record_run_summary(self, task_state, summary):
-        """把 viewer 可直接渲染的聚合小计重写到 task_state.json。"""
+        """把聚合小计重写到 task_state.json，并同步更新索引。"""
         path = self.task_state_path(task_state)
         try:
             current = json.loads(path.read_text(encoding="utf-8"))
@@ -98,7 +98,39 @@ class RunStore:
 
     def load_report(self, task_id):
         return json.loads(self.report_path(task_id).read_text(encoding="utf-8"))
-  
+    
+    def _index_run(self, task_state, summary=None):
+        """把一行 run 摘要追加到 runs/index.jsonl。"""
+        index_path = self.index_path()
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+
+        entry = {
+            "run_id": _run_id(task_state),
+            "task_id": getattr(task_state, "task_id", ""),
+            "session_id": getattr(task_state, "session_id", ""),
+            "parent_run_id": getattr(task_state, "parent_run_id", "") or "",
+            "parent_tool_event_index": int(getattr(task_state, "parent_tool_event_index", -1) or -1),
+            "agent_rope": getattr(task_state, "agent_rope", "") or task_state.run_id,
+            "depth": int(getattr(task_state, "depth", 0) or 0),
+            "created_at": getattr(task_state, "created_at", "") or int(time.time()),
+            "user_request": str(getattr(task_state, "user_request", "") or "")[:200],
+            "status": getattr(task_state, "status", ""),
+            "stop_reason": getattr(task_state, "stop_reason", ""),
+            "tool_steps": int(getattr(task_state, "tool_steps", 0) or 0),
+            "attempts": int(getattr(task_state, "attempts", 0) or 0),
+        }
+        inherited = getattr(task_state, "_run_inherited", None) or {}
+        for key in ("approval_policy", "read_only", "sandbox", "model", "provider"):
+            if inherited.get(key) is not None:
+                entry[key] = inherited[key]
+        if summary:
+            entry["summary"] = summary
+
+        with index_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True, ensure_ascii=True))
+            handle.write("\n")
+        return entry
+
     def _write_json_atomic(self, path, payload):
         # 原子写：先写临时文件，再 replace。这样即使中途异常，也不容易留下半截 JSON。
         with tempfile.NamedTemporaryFile(

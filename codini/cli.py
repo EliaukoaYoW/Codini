@@ -64,7 +64,6 @@ HELP_DETAILS = textwrap.dedent(
     /reset   Clear the current session history and memory.
     /skill   List all available skills or read a specific skill.
     /session Show the path to the saved session file.
-    /agents  Show subagent worker status.
     /exit    Exit the agent.
     """
 ).strip()
@@ -433,12 +432,10 @@ def main(argv = None):
     args = build_arg_parser().parse_args(argv)
     console = Console() if HAS_RICH else None
     trace = make_trace(console=console)
-    agent = build_agent(args)
+    agent = build_agent(args, trace=trace)
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OPENAI_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", "")))
     # print(build_welcome(agent, model, host))
-    
-    console = Console() if HAS_RICH else None
 
     if HAS_RICH:
         build_welcome_rich(agent, model, host)
@@ -536,43 +533,6 @@ def main(argv = None):
             else:
                 result = tool_list_skills(agent, {})
                 print(result)
-            continue
-        if user_input.startswith("/trace"):
-            from .trace_view import view_trace_in_browser, list_traces, print_trace_list
-            parts = user_input.split()
-            if len(parts) >= 3 and parts[1] in {"open", "show", "browser"}:
-                run_id = parts[2]
-                try:
-                    path = view_trace_in_browser(agent.run_store, run_id)
-                    print(f"trace viewer written to: {path}")
-                except Exception as exc:
-                    print(f"error opening trace: {exc}", file=sys.stderr)
-            elif len(parts) >= 2 and parts[1] == "latest":
-                runs = list_traces(agent.run_store, session_id=agent.session.get("id"), limit=1)
-                if not runs:
-                    print("no trace found for current session")
-                else:
-                    path = view_trace_in_browser(agent.run_store, runs[0]["run_id"])
-                    print(f"trace viewer (latest) written to: {path}")
-            elif len(parts) >= 2 and parts[1] == "list":
-                limit = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 20
-                print_trace_list(
-                    agent.run_store,
-                    session_id=agent.session.get("id"),
-                    limit=limit,
-                )
-            else:
-                runs = list_traces(agent.run_store, session_id=agent.session.get("id"), limit=10)
-                if not runs:
-                    print("no traces yet for current session")
-                else:
-                    print_trace_list(agent.run_store, session_id=agent.session.get("id"), limit=10)
-                print()
-                print("usage:")
-                print("  /trace                        # list recent traces for this session")
-                print("  /trace latest                 # open latest trace in browser")
-                print("  /trace open <run_id>          # open a specific run's trace in browser")
-                print("  /trace list [limit]           # list recent traces (default 10)")
             continue
         try:
             result = agent.ask(user_input)
