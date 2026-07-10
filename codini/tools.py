@@ -7,6 +7,8 @@
 import shutil
 import subprocess
 import textwrap
+import uuid
+from datetime import datetime
 from functools import partial
 
 from .workspace import IGNORED_PATH_NAMES, clip
@@ -52,12 +54,11 @@ BASE_TOOL_SPECS = {
         "risky": False,
         "description": "Read a specific skill document by name.",
     },
-}
-
-DELEGATE_TOOL_SPECS = {
-    "schema": {"task": "str", "max_steps": "int=3"},
-    "risky": True,
-    "description": "Ask a bounded read-only sub agent to investigate."
+    "delegate": {
+        "schema": {"task": "str", "max_steps": "int=5"},
+        "risky": True,
+        "description": "Ask a bounded read-only sub agent to investigate."
+    }
 }
 
 TOOL_EXAMPLES = {
@@ -73,15 +74,18 @@ TOOL_EXAMPLES = {
 }
 
 
+_DELEGATE_FORMAT_INSTRUCTION = textwrap.dedent("""\
+    After completing the investigation, write your findings directly in the <final> answer as clear, concise natural language. Do not add any labels like STATUS, STEPS_USED, or FINDINGS — just write the factual conclusions you discovered.
+    """)
+
+
 def build_tool_registry(agent):
     # 工具不是动态发现的，而是显式注册的。这样模型看到的是一个有边界、可审计的动作集合。
     tools = {
         name: {**spec, "run": partial(_TOOL_RUNNERS[name], agent)}
         for name, spec in BASE_TOOL_SPECS.items()
+        if name != "delegate" or agent.depth < agent.max_depth
     }
-    # 子 agent 是刻意做成受限能力的：一旦深度耗尽，就连 delegate 这个工具都不再暴露给模型。
-    if agent.depth < agent.max_depth:
-        tools["delegate"] = {**DELEGATE_TOOL_SPECS, "run": partial(tool_delegate, agent)}
     return tools
 
 def tool_example(name):
@@ -179,6 +183,7 @@ def tool_list_files(agent, args):
         lines.append(f"{kind} {entry.relative_to(agent.root)}")
     return "\n".join(lines) or "(empty)"
 
+
 def tool_read_file(agent, args):
     path = agent.path(args["path"])
     if not path.is_file():
@@ -189,8 +194,13 @@ def tool_read_file(agent, args):
     if start < 1 or end < start:
         raise ValueError("invalid line range")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    total = len(lines)
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(agent.root)}\n{body}"
+    header = f"# {path.relative_to(agent.root)} ({total} lines total)"
+    if end < total:
+        header += f" [lines {start}-{min(end, total)}]"
+    return f"{header}\n{body}"
+
 
 def tool_search(agent, args):
     pattern = str(args.get("pattern","")).strip()
@@ -205,6 +215,8 @@ def tool_search(agent, args):
             cwd=agent.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace"
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
     
@@ -221,6 +233,7 @@ def tool_search(agent, args):
                     return "\n".join(matches)
     return "\n".join(matches) or "(no matches)"
 
+
 def tool_run_shell(agent, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -235,6 +248,8 @@ def tool_run_shell(agent, args):
         capture_output = True,
         text = True,
         timeout = timeout,
+        encoding = "utf-8",
+        errors = "replace",
         env = agent.shell_env()
     )
     return textwrap.dedent(
@@ -255,6 +270,7 @@ def tool_write_file(agent, args):
     path.write_text(content, encoding="utf-8")
     return f"wrote {path.relative_to(agent.root)} ({len(content)} chars)"
 
+
 def tool_patch_file(agent, args):
     path = agent.path(args["path"])
     if not path.is_file():
@@ -272,32 +288,77 @@ def tool_patch_file(agent, args):
     path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
     return f"patched {path.relative_to(agent.root)} ({len(text)} chars)"
 
+
+def _parse_delegate_result(raw: str) -> str:
+    """ 直接透传子 agent 的自然语言结论给父 agent，不再需要结构化解析。"""
+    return raw.strip()
+
+def _count_trace_events(agent):
+    """估算一下父 run 当前 trace 已写了多少条事件。
+
+    这是子 task_state.parent_tool_event_index 的来源——viewer 展开父 trace 时
+    能高亮那个"调用了子 agent"的 tool_executed 事件。
+    """
+    try:
+        trace_path = agent.run_store.trace_path(agent.current_task_state)
+        with trace_path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except (OSError, AttributeError, TypeError, ValueError):
+        return -1
+
+
 def tool_delegate(agent, args):
     if agent.depth >= agent.max_depth:
         raise ValueError("delegate depth exceeded")
     task = str(args.get("task", "")).strip()
     if not task:
         raise ValueError("task must not be empty")
-    
-    from .runtime import Codini
 
+    from .runtime import Codini
+    from .trace import SubAgentTrace
+
+    parent_run_id = getattr(getattr(agent, "current_task_state", None), "run_id", "") or ""
+    parent_agent_rope = getattr(getattr(agent, "current_task_state", None), "agent_rope", "") or parent_run_id
+    parent_depth = int(getattr(agent, "depth", 0) or 0)
+
+    child_session = {
+        "id": agent.session.get("id", "") + "-sub-" + uuid.uuid4().hex[:6],
+        "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "workspace_root": agent.workspace.repo_root,
+        "history": [],
+        "memory": agent.memory.to_dict(),
+        "parent_session_id": agent.session.get("id", ""),
+    }
     child = Codini(
-        model_client = agent.model_client,
-        workspace = agent.workspace,
-        session_store = agent.session_store,
-        run_store = agent.run_store,
-        approval_policy = "never",
-        max_steps = int(args.get("max_steps", 3)),
-        max_new_tokens = agent.max_new_tokens,
-        depth = agent.depth + 1,
-        max_depth = agent.max_depth,
-        read_only = True,
-        secret_env_names = agent.secret_env_names,
-        shell_env_allowlist = agent.shell_env_allowlist
+        model_client=agent.model_client,
+        workspace=agent.workspace,
+        session_store=agent.session_store,
+        run_store=agent.run_store,
+        approval_policy="never",
+        max_steps=int(args.get("max_steps", 5)),
+        max_new_tokens=agent.max_new_tokens,
+        depth=parent_depth + 1,
+        max_depth=agent.max_depth,
+        read_only=True,
+        secret_env_names=agent.secret_env_names,
+        shell_env_allowlist=agent.shell_env_allowlist,
+        session=child_session,
+        viz=SubAgentViz(agent.viz) if agent.viz else None,
     )
-    child.session["memory"]["task"] = task
-    child.session["memory"]["notes"] = [clip(agent.history_text(), 300)]
-    return "delegate_result:\n" + child.ask(task)
+    # 把父 run 信息显式灌进子 agent 属性，等子 ask() 启动时会复制给子 task_state
+    child.parent_run_id = parent_run_id
+    child.parent_tool_event_index = _count_trace_events(agent)
+    child.agent_rope = parent_agent_rope
+
+    # 用 append_note 插入父 context 笔记，防止被 memory normalizer 擦除
+    child.memory.append_note(
+        text=clip(agent.history_text(), 1000),
+        tags=["parent_history"],
+        source="parent_agent",
+    )
+    child.session["memory"] = child.memory.to_dict()
+    raw = child.ask(task + _DELEGATE_FORMAT_INSTRUCTION)
+    return "delegate_result:\n" + _parse_delegate_result(raw)
 
 
 def tool_list_skills(agent, args):
@@ -357,5 +418,6 @@ _TOOL_RUNNERS = {
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
     "list_skills": tool_list_skills,
-    "read_skill": tool_read_skill
+    "read_skill": tool_read_skill,
+    "delegate": tool_delegate
 }
