@@ -438,7 +438,7 @@ def normalize_memory_state(state, workspace_root=None):
 
 def set_task_summary(state, summary, workspace_root = None):
     state = normalize_memory_state(state, workspace_root)
-    state["working"]["task_summary"] = clip(str(summary).strip(), 300)
+    state["working"]["task_summary"] = clip(str(summary).strip(), 1000)
     state["task"] = state["working"]["task_summary"]
     return state
 
