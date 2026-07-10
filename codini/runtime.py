@@ -12,6 +12,9 @@ import textwrap
 import uuid
 import hashlib
 import time
+import difflib
+import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +56,75 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
 SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
+
+
+def _count_run_events(trace_path):
+    """粗略计数：统计 trace.jsonl 已有的行数，用作 event_index。"""
+    try:
+        with Path(trace_path).open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+def _build_trace_inherited(task_state):
+    """构造 trace event 自动注入的 inherited 元数据。"""
+    parent_run_id = getattr(task_state, "parent_run_id", "") or ""
+    parent_tool_event_index = int(getattr(task_state, "parent_tool_event_index", -1) or -1)
+    agent_rope = getattr(task_state, "agent_rope", "") or getattr(task_state, "run_id", "")
+    session_id = getattr(task_state, "session_id", "") or ""
+    return {
+        "agent_rope": agent_rope,
+        "depth": int(getattr(task_state, "depth", 0) or 0),
+        "parent_run_id": parent_run_id,
+        "parent_tool_event_index": parent_tool_event_index,
+        "session_id": session_id,
+        "approval_policy": getattr(task_state, "approval_policy", "") or "",
+        "read_only": bool(getattr(task_state, "read_only", False)),
+        "sandbox": getattr(task_state, "sandbox", "none") or "none",
+        "model": getattr(task_state, "model", "") or "",
+        "provider": getattr(task_state, "provider", "") or "",
+    }
+
+
+def _extract_run_usage_fields(completion_metadata):
+    """把后端返回的 usage / cache 字段归一化成 viewer 可渲染的平坦字段。
+
+    provider 字段名可能不一样（prompt_tokens / input_tokens），这里做一层适配。
+    """
+    completion_metadata = completion_metadata or {}
+    usage = completion_metadata.get("usage") or {}
+    input_details = (
+        usage.get("input_tokens_details") or usage.get("prompt_tokens_details")
+        or completion_metadata.get("prompt_cache_details") or {}
+    )
+    prompt_tokens = (
+        completion_metadata.get("prompt_tokens")
+        or completion_metadata.get("input_tokens") or usage.get("prompt_tokens")
+        or usage.get("input_tokens") or 0
+    )
+    completion_tokens = (
+        completion_metadata.get("completion_tokens")
+        or completion_metadata.get("output_tokens") or usage.get("completion_tokens")
+        or usage.get("output_tokens") or 0
+    )
+    total_tokens = (
+        completion_metadata.get("total_tokens")
+        or usage.get("total_tokens")
+        or (int(prompt_tokens or 0) + int(completion_tokens or 0))
+    )
+    cached_tokens = (
+        completion_metadata.get("cached_tokens")
+        or input_details.get("cached_tokens")
+        or 0
+    )
+    return {
+        "prompt_tokens": int(prompt_tokens or 0),
+        "completion_tokens": int(completion_tokens or 0),
+        "total_tokens": int(total_tokens or 0),
+        "cached_tokens": int(cached_tokens or 0),
+        "cache_hit": int(cached_tokens or 0) > 0,
+    }
 
 @dataclass
 class PromptPrefix:
@@ -100,8 +172,10 @@ class Codini:
             shell_env_allowlist=None,
             secret_env_names=None,
             feature_flags=None,
-            sandbox=None
+            sandbox=None,
+            trace=None,
     ):
+        self.trace = trace
         self.model_client = model_client
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
@@ -138,6 +212,9 @@ class Codini:
         self.context_manager = ContextManager(self)
         self.resume_state = self.evaluate_resume_state()
         self.session_path = self.session_store.save(self.session)
+        self.parent_run_id = ""
+        self.parent_tool_event_index = -1
+        self.agent_rope = ""
         self.current_task_state = None
         self.current_run_dir = None
         self.last_prompt_metadata = {}
@@ -149,6 +226,16 @@ class Codini:
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
+        }
+        # run 级共享字段，会在 emit_trace 时自动挂进每个 event 的 inherited 段。
+        # 这样 viewer 渲染单个 event 无需回头翻 task_state。
+        self._run_inherited_seed = {
+            "approval_policy": self.approval_policy,
+            "read_only": bool(self.read_only),
+            "sandbox": getattr(self.sandbox, "name", "none") or "none",
+            "model": getattr(model_client, "model", "") or "",
+            "provider": model_client.__class__.__name__,
+            "session_id": (session or {}).get("id", "") if session else "",
         }
 
     @classmethod
@@ -400,6 +487,7 @@ class Codini:
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
+            - When using delegate, pass the task directly without pre-reading files yourself first — the sub-agent has the same tools and will read what it needs.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
             - If the user asks you to remember, save, or store a fact/decision/preference/convention, you must format it on a new line in your final answer using one of these formats to ensure it is persisted:
                 - Decision: <content> (or 决策：<content>),
@@ -482,11 +570,11 @@ class Codini:
                 seen_reads.add(path)
 
             if item["role"] == "tool":
-                limit = 900 if recent else 180
+                limit = 10000 if recent else 500
                 lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
                 lines.append(clip(item["content"], limit))
             else:
-                limit = 900 if recent else 220
+                limit = 10000 if recent else 500
                 lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
 
         return clip("\n".join(lines), MAX_HISTORY)
@@ -609,13 +697,136 @@ class Codini:
         metadata.update(self.detected_secret_env_summary())
         return prompt, metadata
     
-    def emit_trace(self, task_state, event, payload = None):
-        """ 向当前运行的 trace 文件写入一条带时间戳的事件记录 """
-        payload = self.redact_artifact(payload or {})
+    def emit_trace(self, task_state, event, payload=None):
+        """向当前运行的 trace 文件写入一条带时间戳的事件记录。
+
+        每条 trace event 会被自动注入一段 `inherited` 元数据，包括：
+        - 父子层级 (agent_rope / parent_run_id / depth)
+        - run 级共享字段 (approval_policy / read_only / sandbox / model / provider)
+        - 事件顺序信息 (event_index / created_inherited_fields)
+
+        这样：
+        - viewer 渲染单条 event 时无需回头翻 task_state.json
+        - 从父 trace 跳到子 trace 时能立刻拿到调用者的环境信息
+        - 索引里的 run 摘要和 trace 里的每个 event 是对齐的
+        """
+        payload = dict(self.redact_artifact(payload or {}))
         payload["event"] = event
         payload["created_at"] = now()
+        if event == "checkpoint_created":
+            checkpoint_id = payload.get("checkpoint_id")
+            if checkpoint_id:
+                state = self.checkpoint_state()
+                ckpt = state.get("items", {}).get(checkpoint_id)
+                if ckpt:
+                    payload.update({
+                        "current_goal": ckpt.get("current_goal", ""),
+                        "current_blocker": ckpt.get("current_blocker", ""),
+                        "next_step": ckpt.get("next_step", ""),
+                        "key_files": [kf.get("path") for kf in ckpt.get("key_files", []) if kf.get("path")],
+                    })
+        event_index = _count_run_events(self.run_store.trace_path(task_state))
+        payload["event_index"] = event_index
+
+        inherited = _build_trace_inherited(task_state)
+        payload["inherited"] = inherited
+        payload["created_inherited_fields"] = sorted(inherited.keys())
+
         self.run_store.append_trace(task_state, payload)
+
         return payload
+
+    def _complete_with_heartbeat(self, prompt, prompt_cache_key, prompt_cache_retention):
+        model_started_at = time.monotonic()
+        try:
+            raw = self.model_client.complete(
+                prompt,
+                self.max_new_tokens,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
+        except Exception as e:
+            err_msg = str(e)
+            if "read operation timed out" in err_msg or "timeout" in err_msg.lower():
+                err_msg = f"LLM API request timed out (network read operation timed out). The model provider is likely overloaded: {e}"
+            if self.trace:
+                self.trace.on_run_error(f"model call failed: {err_msg}")
+            raise
+        model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
+        return raw
+
+    def _accum_model(self, completion_metadata, duration_ms=0):
+        """把后端的 usage / cache 字段累加到当前 run 的累加器。"""
+        accum = getattr(self, "_run_accum", None)
+        if accum is None:
+            self._run_accum = {
+                "tokens": {"prompt": 0, "completion": 0, "total": 0, "cached": 0},
+                "latency": {"model_ms": 0, "tool_ms": 0, "count_model": 0, "count_tool": 0},
+                "tools": {},
+            }
+            accum = self._run_accum
+        usage = _extract_run_usage_fields(completion_metadata)
+        tokens = accum["tokens"]
+        tokens["prompt"] += usage["prompt_tokens"]
+        tokens["completion"] += usage["completion_tokens"]
+        tokens["total"] += usage["total_tokens"]
+        tokens["cached"] += usage["cached_tokens"]
+        latency = accum["latency"]
+        latency["model_ms"] += int(duration_ms or 0)
+        latency["count_model"] += 1
+
+    def _accum_tool(self, tool_name, duration_ms=0):
+        """把一次工具执行累加进当前 run 的累加器。"""
+        accum = getattr(self, "_run_accum", None)
+        if accum is None:
+            self._run_accum = {
+                "tokens": {"prompt": 0, "completion": 0, "total": 0, "cached": 0},
+                "latency": {"model_ms": 0, "tool_ms": 0, "count_model": 0, "count_tool": 0},
+                "tools": {},
+            }
+            accum = self._run_accum
+        accum["tools"][tool_name] = accum["tools"].get(tool_name, 0) + 1
+        accum["latency"]["tool_ms"] += int(duration_ms or 0)
+        accum["latency"]["count_tool"] += 1
+
+    def record_run_summary(self, task_state):
+        """根据运行中的累加器，算一份 viewer 可渲染的聚合小计。
+
+        聚合小计包括：
+        - tokens: prompt/completion/total/cached
+        - latency: model_ms/tool_ms 以及各自的 count
+        - tools: 各工具执行次数 top 列表
+        然后重写到 task_state.json（viewer 真空读取）+ 更新 runs/index.jsonl。
+        """
+        accum = getattr(self, "_run_accum", None) or {}
+        tokens = accum.get("tokens") or {"prompt": 0, "completion": 0, "total": 0, "cached": 0}
+        latency = accum.get("latency") or {"model_ms": 0, "tool_ms": 0, "count_model": 0, "count_tool": 0}
+        tools = accum.get("tools") or {}
+        # 兜底：如果累加器没被初始化（比如某些异常路径），回退到扫 history。
+        if not tools:
+            for item in self.session["history"]:
+                if item.get("role") != "tool":
+                    continue
+                name = item.get("name") or ""
+                tools[name] = tools.get(name, 0) + 1
+
+        summary = {
+            "tokens": tokens,
+            "latency": latency,
+            "tools": sorted(tools.items(), key=lambda kv: kv[1], reverse=True),
+            "attempts": int(task_state.attempts or 0),
+            "tool_steps": int(task_state.tool_steps or 0),
+            "status": task_state.status,
+            "stop_reason": task_state.stop_reason,
+        }
+        task_state.summary = summary
+        self.session.setdefault("_run_summaries", {})[task_state.run_id] = summary
+        try:
+            self.run_store.record_run_summary(task_state, summary)
+        except Exception:
+            # 聚合小计只是 viewer 的锦上添花；写坏了也不应该阻塞主流程。
+            pass
+        return summary
 
     def capture_workspace_snapshot(self):
         snapshot = {}
@@ -651,6 +862,77 @@ class Codini:
             else:
                 summaries.append(f"modified: {path}")
         return changed_paths, summaries
+
+    def _generate_diffs(self, affected_paths, before_snapshot, after_snapshot, rel_target_path, before_content):
+        diffs = []
+        for path in affected_paths:
+            p = self.root / path
+            diff_text = ""
+            diff_type = "modified"
+            if path not in before_snapshot:
+                diff_type = "created"
+            elif path not in after_snapshot:
+                diff_type = "deleted"
+            
+            try:
+                if diff_type == "deleted":
+                    if rel_target_path == path and before_content is not None:
+                        diff_lines = list(difflib.unified_diff(
+                            before_content.splitlines(keepends=True),
+                            [],
+                            fromfile=f"a/{path}",
+                            tofile="/dev/null"
+                        ))
+                        diff_text = "".join(diff_lines)
+                elif diff_type == "created":
+                    if p.is_file():
+                        after_content = p.read_text(encoding="utf-8", errors="replace")
+                        diff_lines = list(difflib.unified_diff(
+                            [],
+                            after_content.splitlines(keepends=True),
+                            fromfile="/dev/null",
+                            tofile=f"b/{path}"
+                        ))
+                        diff_text = "".join(diff_lines)
+                else: # modified
+                    git_diff_success = False
+                    if shutil.which("git") and (self.root / ".git").is_dir():
+                        try:
+                            git_result = subprocess.run(
+                                ["git", "diff", "--", str(p)],
+                                cwd=self.root,
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                timeout=5
+                            )
+                            if git_result.returncode == 0 and git_result.stdout.strip():
+                                diff_text = git_result.stdout
+                                git_diff_success = True
+                        except Exception:
+                            pass
+                    
+                    if not git_diff_success:
+                        if rel_target_path == path and before_content is not None:
+                            if p.is_file():
+                                after_content = p.read_text(encoding="utf-8", errors="replace")
+                                diff_lines = list(difflib.unified_diff(
+                                    before_content.splitlines(keepends=True),
+                                    after_content.splitlines(keepends=True),
+                                    fromfile=f"a/{path}",
+                                    tofile=f"b/{path}"
+                                ))
+                                diff_text = "".join(diff_lines)
+            except Exception as diff_exc:
+                diff_text = f"Error generating diff: {diff_exc}"
+            
+            diffs.append({
+                "path": path,
+                "type": diff_type,
+                "diff_text": diff_text
+            })
+        return diffs
 
     def create_checkpoint(self, task_state, user_message, trigger):
         """ 创建并保存一个任务检查点 记录当前目标、关键文件、下一步计划等信息"""
@@ -808,10 +1090,45 @@ class Codini:
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
-        task_state = TaskState.create(run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
+        if self.trace:
+            self.trace.on_run_start(user_message)
+
+        task_state = TaskState.create(
+            run_id=self.new_run_id(),
+            task_id=self.new_task_id(),
+            user_request=user_message,
+            parent_run_id=getattr(self, "parent_run_id", ""),
+            parent_tool_event_index=getattr(self, "parent_tool_event_index", -1),
+            agent_rope=getattr(self, "agent_rope", ""),
+        )
         task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
+        seed = getattr(self, "_run_inherited_seed", {}) or {}
+        task_state.session_id = seed.get("session_id", "") or self.session.get("id", "")
+        task_state.approval_policy = seed.get("approval_policy", "")
+        task_state.read_only = bool(seed.get("read_only", False))
+        task_state.sandbox = seed.get("sandbox", "none")
+        task_state.model = seed.get("model", "")
+        task_state.provider = seed.get("provider", "")
+        task_state.depth = int(getattr(self, "depth", 0) or 0)
+        # run 级共享字段也存到 task_state，viewer 直接读取 task_state.json 也能拿到
+        task_state._run_inherited = dict(seed)
+        task_state._run_inherited["depth"] = task_state.depth
+        task_state._run_inherited["read_only"] = task_state.read_only
+        task_state._run_inherited["agent_rope"] = task_state.agent_rope
+        task_state._run_inherited["session_id"] = task_state.session_id
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
+        # 累加器：运行中的 tokens / latency / tools，写 summary 时直接用，不必扫 trace。
+        self._run_accum = {
+            "tokens": {"prompt": 0, "completion": 0, "total": 0, "cached": 0},
+            "latency": {
+                "model_ms": 0,
+                "tool_ms": 0,
+                "count_model": 0,
+                "count_tool": 0,
+            },
+            "tools": {},
+        }
         self.emit_trace(
             task_state,
             "run_started",
@@ -893,6 +1210,7 @@ class Codini:
                     "attempts": task_state.attempts,
                     "tool_steps": task_state.tool_steps,
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
+                    "prompt_chars": int(prompt_metadata.get("prefix_chars", 0) or 0) + int(prompt_metadata.get("request_chars", 0) or 0),
                 },
             )
 
@@ -902,30 +1220,36 @@ class Codini:
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
 
+            if self.trace:
+                self.trace.on_thinking_start(attempts, self.max_steps)
+
             model_started_at = time.monotonic()
-            print(prompt)
-            raw = self.model_client.complete(
-                prompt,
-                self.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
-            )
+            raw = self._complete_with_heartbeat(prompt, prompt_cache_key, prompt_cache_retention)
+            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
+
+            if self.trace:
+                self.trace.on_thinking_end(model_duration_ms)
+
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，方便统一写入 report 和 trace。
                 prompt_metadata.update(completion_metadata)
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
+            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
+            # 累加 tokens / model latency，用于 viewer 的聚合卡片
+            self._accum_model(completion_metadata, duration_ms=model_duration_ms)
             # 完全拿到模型的回复后去解析生成内容
             kind, payload = self.parse(raw)
-            
+
             self.emit_trace(
                 task_state,
                 "model_parsed",
                 {
                     "kind": kind,
-                    "completion_metadata": completion_metadata,
-                    "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+                    "raw": clip(raw, 600),
+                    "duration_ms": model_duration_ms,
+                    **_extract_run_usage_fields(completion_metadata),
                 },
             )
             if kind == "tool":
@@ -933,8 +1257,23 @@ class Codini:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 task_state.record_tool(name)
+                risky = bool(self.tools.get(name, {}).get("risky", False))
+
+                if self.trace:
+                    self.trace.on_tool_call(name, args, risky)
+
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
+                tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
+
+                tool_status = (self._last_tool_result_metadata or {}).get("tool_status", "ok")
+                success = tool_status not in ("error", "rejected", "partial_success")
+
+                if self.trace:
+                    self.trace.on_tool_result(name, result, tool_duration_ms, success)
+
+                # 累加 tool 耗时 / tools 表，用于 viewer 的聚合卡片
+                self._accum_tool(name, duration_ms=tool_duration_ms)
                 self.record(
                     {
                         "role": "tool",
@@ -945,15 +1284,34 @@ class Codini:
                     }
                 )
                 self.run_store.write_task_state(task_state)
+                tool_result_meta = dict(self._last_tool_result_metadata or {})
+                exit_code = tool_result_meta.get("exit_code")
+                if exit_code is None and name == "run_shell":
+                    match = re.search(r"exit_code:\s*(-?\d+)", result)
+                    exit_code = int(match.group(1)) if match else 0
+                security_event = tool_result_meta.get("security_event_type") or ""
+                # 最近一次失败/拒绝的完整原文，viewer 渲染时能直接看到错误全貌。
+                full_error = ""
+                if tool_result_meta.get("tool_status") in {"error", "partial_success", "rejected"}:
+                    full_error = str(result or "")
                 self.emit_trace(
                     task_state,
                     "tool_executed",
                     {
                         "name": name,
                         "args": args,
-                        "result": clip(result, 500),
-                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(self._last_tool_result_metadata or {}),
+                        "result": clip(result, 800),
+                        "result_full": full_error or clip(result, 2000),
+                        "full_error": full_error,
+                        "duration_ms": tool_duration_ms,
+                        "exit_code": exit_code,
+                        "security_event_type": security_event,
+                        "risk_level": tool_result_meta.get("risk_level"),
+                        "workspace_changed": tool_result_meta.get("workspace_changed"),
+                        "affected_paths": tool_result_meta.get("affected_paths"),
+                        "tool_status": tool_result_meta.get("tool_status"),
+                        "tool_error_code": tool_result_meta.get("tool_error_code"),
+                        "diffs": tool_result_meta.get("diffs", []),
                     },
                 )
 
@@ -972,11 +1330,37 @@ class Codini:
             if kind == "retry":
                 self.record({"role": "assistant", "content": payload, "created_at": now()})
                 self.run_store.write_task_state(task_state)
+                if self.trace:
+                    self.trace.on_response_correction(attempts)
                 continue
             final = (payload or raw).strip()
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
             self.promote_durable_memory(user_message, final)
+
+            if self.trace:
+                total_duration_ms = int((time.monotonic() - run_started_at) * 1000)
+                tools_trace = []
+                tool_count = task_state.tool_steps
+                for item in self.session["history"][-(tool_count + 1):]:
+                    if item.get("role") == "tool":
+                        tools_trace.append({
+                            "name": item.get("name", ""),
+                            "success": True,
+                            "summary": "",
+                            "duration_ms": 0,
+                        })
+                if tools_trace:
+                    tools_trace[0]["duration_ms"] = self._run_accum["latency"]["tool_ms"]
+                self.trace.on_answer(
+                    final,
+                    list(self.last_durable_promotions),
+                    list(self.last_durable_rejections),
+                    tools_trace,
+                    total_duration_ms,
+                    self.last_prompt_metadata,
+                    self.last_completion_metadata,
+                )
 
             checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
             self.run_store.write_task_state(task_state)
@@ -999,6 +1383,7 @@ class Codini:
                 },
             )
             self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+            self.record_run_summary(task_state)
             return final
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
@@ -1031,6 +1416,7 @@ class Codini:
             },
         )
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        self.record_run_summary(task_state)
         return final
 
     def run_tool(self, name, args):
@@ -1098,6 +1484,18 @@ class Codini:
             }
             return f"error: approval denied for {name}"
 
+        target_path = args.get("path") if name in {"write_file", "patch_file"} else None
+        before_content = None
+        rel_target_path = None
+        if target_path:
+            try:
+                abs_target_path = self.path(target_path)
+                if abs_target_path.is_file():
+                    before_content = abs_target_path.read_text(encoding="utf-8", errors="replace")
+                rel_target_path = abs_target_path.relative_to(self.root).as_posix()
+            except Exception:
+                pass
+
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
@@ -1105,6 +1503,7 @@ class Codini:
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
+            diffs = self._generate_diffs(affected_paths, before_snapshot, after_snapshot, rel_target_path, before_content)
             tool_status = "ok"
             tool_error_code = ""
             if name == "run_shell":
@@ -1127,6 +1526,7 @@ class Codini:
                 "workspace_changed": workspace_changed,
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
+                "diffs": diffs,
             }
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
@@ -1134,6 +1534,7 @@ class Codini:
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
+            diffs = self._generate_diffs(affected_paths, before_snapshot, after_snapshot, rel_target_path, before_content)
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
             self._last_tool_result_metadata = {
                 "tool_status": "partial_success" if workspace_changed else "error",
@@ -1145,6 +1546,7 @@ class Codini:
                 "workspace_changed": workspace_changed,
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
+                "diffs": diffs,
             }
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return f"error: tool {name} failed: {exc}"
@@ -1220,13 +1622,13 @@ class Codini:
 
     def approve(self, name, args):
         if self.read_only:
-            return False
+            return name == "delegate"
         if self.approval_policy == "auto":
             return True
         if self.approval_policy == "never":
             return False
         try:
-            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
+            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=False)}? [y/N] ")
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
