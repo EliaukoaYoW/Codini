@@ -21,6 +21,7 @@ from .branding import (
     render_mascot_rich_text,
 )
 
+from .trace import make_trace
 from .slash import interactive_prompt
 
 try:
@@ -335,7 +336,7 @@ def build_agent(args):
     这个函数负责把“启动参数”翻译成“agent 运行现场”。
 
     输入 / 输出：
-    - 输入：`argparse` 解析后的 `args`
+    - 输入：`argparse` 解析后的 `args`，以及可选的 trace 可视化后端
     - 输出：一个新的 `Codini`，或一个从旧 session 恢复出来的 `Codini`
 
     在 agent 链路里的位置：
@@ -366,7 +367,8 @@ def build_agent(args):
             max_steps = args.max_steps,
             max_new_tokens = args.max_new_tokens,
             secret_env_names = configured_secret_names,
-            sandbox = sandbox
+            sandbox = sandbox,
+            trace = trace
         )
     return Codini(
         model_client=model,
@@ -376,7 +378,8 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
-        sandbox=sandbox
+        sandbox=sandbox,
+        trace = trace
     )
 
 def _get_skills_list(agent):
@@ -419,7 +422,7 @@ def build_arg_parser():
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     parser.add_argument("--sandbox", choices=("none", "bubblewrap"), default="none", help="Sandbox backend for shell execution (default: none).")
@@ -428,6 +431,8 @@ def build_arg_parser():
 
 def main(argv = None):
     args = build_arg_parser().parse_args(argv)
+    console = Console() if HAS_RICH else None
+    trace = make_trace(console=console)
     agent = build_agent(args)
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OPENAI_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", "")))
@@ -444,11 +449,13 @@ def main(argv = None):
         # 单次会话模式：只跑一次 ask，不进入 REPL 循环
         prompt = " ".join(args.prompt).strip()
         if prompt:
-            print()
             try:
                 print(agent.ask(prompt))
             except RuntimeError as e:
-                print(str(e), file = sys.stderr)
+                if trace:
+                    trace.on_run_error(str(e))
+                else:
+                    print(str(e), file = sys.stderr)
                 return 1
         return 0
 
@@ -567,10 +574,15 @@ def main(argv = None):
                 print("  /trace open <run_id>          # open a specific run's trace in browser")
                 print("  /trace list [limit]           # list recent traces (default 10)")
             continue
-        print()
         try:
             result = agent.ask(user_input)
             for char in result:
                 print(char, end="", flush=True)
+        except KeyboardInterrupt:
+            print("\n[interrupted]")
+            continue
         except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
+            if trace:
+                trace.on_run_error(str(exc))
+            else:
+                print(str(exc), file=sys.stderr)
