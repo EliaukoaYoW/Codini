@@ -327,7 +327,7 @@ def build_context_usage(metadata):
             console.print(f"  • [cyan]{red['section']}[/]: {red['before_chars']} -> {red['after_chars']} (overflow: {red['overflow_chars']} chars)")
     print()
 
-def build_agent(args):
+def build_agent(args, trace=None):
     """
     根据 CLI 参数装配出一个可运行的 Codini 实例。
     为什么存在：
