@@ -4,6 +4,12 @@ from .runtime import MiniAgent, Codini, SessionStore
 from .run_store import RunStore
 from .workspace import WorkspaceContext
 
+def __getattr__(name):
+    if name in _CLI_EXPORTS:
+        from . import cli
+        return getattr(cli, name)
+    raise AttributeError(f"module 'codini' has no attribute {name!r}")
+
 __all__ = [
     "FakeModelClient",
     "Codini",

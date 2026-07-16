@@ -27,6 +27,7 @@ from .task_state import TaskState
 from .sandbox import NoSandbox
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .trace import Tracer, TraceSpanProcessor, FileSpanExporter, Span
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
@@ -56,35 +57,6 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
 SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
-
-
-def _count_run_events(trace_path):
-    """粗略计数：统计 trace.jsonl 已有的行数，用作 event_index。"""
-    try:
-        with Path(trace_path).open("r", encoding="utf-8") as handle:
-            return sum(1 for line in handle if line.strip())
-    except OSError:
-        return 0
-
-
-def _build_trace_inherited(task_state):
-    """构造 trace event 自动注入的 inherited 元数据。"""
-    parent_run_id = getattr(task_state, "parent_run_id", "") or ""
-    parent_tool_event_index = int(getattr(task_state, "parent_tool_event_index", -1) or -1)
-    agent_rope = getattr(task_state, "agent_rope", "") or getattr(task_state, "run_id", "")
-    session_id = getattr(task_state, "session_id", "") or ""
-    return {
-        "agent_rope": agent_rope,
-        "depth": int(getattr(task_state, "depth", 0) or 0),
-        "parent_run_id": parent_run_id,
-        "parent_tool_event_index": parent_tool_event_index,
-        "session_id": session_id,
-        "approval_policy": getattr(task_state, "approval_policy", "") or "",
-        "read_only": bool(getattr(task_state, "read_only", False)),
-        "sandbox": getattr(task_state, "sandbox", "none") or "none",
-        "model": getattr(task_state, "model", "") or "",
-        "provider": getattr(task_state, "provider", "") or "",
-    }
 
 
 def _extract_run_usage_fields(completion_metadata):
@@ -126,6 +98,24 @@ def _extract_run_usage_fields(completion_metadata):
         "cache_hit": int(cached_tokens or 0) > 0,
     }
 
+
+def _extract_error_payload(message):
+    text = str(message or "")
+    start = text.find("{")
+    if start < 0:
+        return {}
+    try:
+        payload = json.loads(text[start:])
+    except Exception:
+        return {}
+    if isinstance(payload, dict):
+        nested = payload.get("error")
+        if isinstance(nested, dict):
+            return nested
+        return payload
+    return {}
+
+
 @dataclass
 class PromptPrefix:
     text: str
@@ -140,20 +130,20 @@ class SessionStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path(self, session_id):
-        return self.root / f"{session_id}.json"
+        return self.root / session_id / "session.json"
 
     def save(self, session):
         path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(session, indent=2, ensure_ascii=False), encoding="utf-8")
         return path
 
     def load(self, session_id):
         return json.loads(self.path(session_id).read_text(encoding="utf-8"))
 
     def latest(self):
-        files = sorted(self.root.glob("*.json"), key=lambda path: path.stat().st_mtime)
-        return files[-1].stem if files else None
-
+        files = sorted(self.root.glob("*/session.json"), key=lambda path: path.stat().st_mtime)
+        return files[-1].parent.name if files else None
 
 class Codini:
     def __init__(
@@ -237,6 +227,10 @@ class Codini:
             "provider": model_client.__class__.__name__,
             "session_id": (session or {}).get("id", "") if session else "",
         }
+        self.tracer = Tracer()
+        if self.trace:
+            self.trace_span_processor = TraceSpanProcessor(self.trace)
+            self.tracer.register_processor(self.trace_span_processor)
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -467,8 +461,8 @@ class Codini:
         model_name = getattr(self.model_client, "model", "unknown")
         text = textwrap.dedent(
             """\
-            You are Codini, a versatile local agent and master of problem-solving, inspired by the legendary Houdini. 
-            Powered by {model_name}, you navigate complex constraints, escape bottlenecks, and unlock elegant solutions in this workspace. 
+            You are Codini, a versatile local agent and master of problem-solving, inspired by the legendary Houdini.
+            Powered by {model_name}, you navigate complex constraints, escape bottlenecks, and unlock elegant solutions in this workspace.
             Much like Houdini resolving the most challenging constraints with absolute precision and ingenuity, you rely on tools to analyze your environment and accomplish your goals.
 
             Rules:
@@ -494,7 +488,7 @@ class Codini:
                 - Preference: <content> (or 偏好：<content>),
                 - Project convention: <content> (or 项目约定：<content>),
                 - Dependency: <content> (or 依赖：<content>).
-            
+
             Sandbox: shell commands run inside a {sandbox_name} sandbox.
             {sandbox_notes}
 
@@ -503,7 +497,7 @@ class Codini:
 
             Valid response examples:
             {examples}
-            
+
             {workspace_text}
             """
         ).format(
@@ -570,14 +564,33 @@ class Codini:
                 seen_reads.add(path)
 
             if item["role"] == "tool":
-                limit = 10000 if recent else 500
+                limit = 10000 if recent else 180
                 lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
                 lines.append(clip(item["content"], limit))
             else:
-                limit = 10000 if recent else 500
-                lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
+                limit = 10000 if recent else 220
+                if item.get("role") == "assistant" and item.get("status") == "failed":
+                    lines.append(self.render_error_history_item(item, limit))
+                else:
+                    lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
 
         return clip("\n".join(lines), MAX_HISTORY)
+
+    def render_error_history_item(self, item, limit):
+        error = item.get("error") if isinstance(item.get("error"), dict) else {}
+        parts = [
+            "[assistant:error]",
+            f"type={error.get('error_type') or item.get('stop_reason') or 'runtime_error'}",
+        ]
+        if error.get("http_status") is not None:
+            parts.append(f"http_status={error.get('http_status')}")
+        if error.get("error_code"):
+            parts.append(f"code={error.get('error_code')}")
+        if error.get("retryable") is not None:
+            parts.append(f"retryable={str(bool(error.get('retryable'))).lower()}")
+        message = error.get("message") or item.get("content") or ""
+        parts.append(f"message={clip(str(message), limit)}")
+        return " ".join(parts)
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name),False))
@@ -589,6 +602,79 @@ class Codini:
     def record(self, item):
         self.session["history"].append(item)
         self.session_path = self.session_store.save(self.session)
+
+    def build_error_info(self, error, stop_reason=""):
+        message = str(error)
+        payload = _extract_error_payload(message)
+        http_match = re.search(r"\bHTTP\s+(\d{3})\b", message, re.I)
+        http_status = int(http_match.group(1)) if http_match else None
+        message_lower = message.lower()
+        provider = str(getattr(self.model_client, "provider", "") or "")
+        if not provider:
+            if message.startswith("OpenAI-compatible"):
+                provider = "OpenAI-compatible"
+            elif message.startswith("Siliconflow"):
+                provider = "Siliconflow"
+            elif message.startswith("Ollama"):
+                provider = "Ollama"
+            else:
+                provider = self.model_client.__class__.__name__
+        error_code = str(payload.get("code") or "").strip()
+        provider_error_type = str(payload.get("type") or "").strip()
+        provider_message = str(payload.get("message") or "").strip()
+        retryable = (
+            http_status in {408, 409, 425, 429, 500, 502, 503, 504}
+            or "timeout" in message_lower
+            or "overloaded" in message_lower
+            or "service_unavailable" in message_lower
+            or "rate_limit" in message_lower
+        )
+        if http_status:
+            error_type = "provider_http_error"
+        elif "timeout" in message_lower:
+            error_type = "provider_timeout"
+        elif provider_error_type:
+            error_type = provider_error_type
+        else:
+            error_type = stop_reason or "runtime_error"
+        return {
+            "error_type": error_type,
+            "error_code": error_code,
+            "provider_error_type": provider_error_type,
+            "provider": provider,
+            "http_status": http_status,
+            "retryable": bool(retryable),
+            "message": provider_message or message,
+            "raw_message": message,
+        }
+
+    def record_error_response(self, task_state, error, error_info=None):
+        message = str(error)
+        run_id = getattr(task_state, "run_id", "")
+        error_info = dict(error_info or self.build_error_info(error, getattr(task_state, "stop_reason", "")))
+        history = self.session.setdefault("history", [])
+        if history:
+            last = history[-1]
+            if (
+                isinstance(last, dict)
+                and last.get("role") == "assistant"
+                and last.get("status") == "failed"
+                and last.get("run_id") == run_id
+            ):
+                return
+        self.record(
+            {
+                "role": "assistant",
+                "content": message,
+                "created_at": now(),
+                "status": getattr(task_state, "status", "") or "failed",
+                "stop_reason": getattr(task_state, "stop_reason", "") or "runtime_error",
+                "run_id": run_id,
+                "trace_id": run_id,
+                "task_id": getattr(task_state, "task_id", ""),
+                "error": error_info,
+            }
+        )
 
     @staticmethod
     def looks_sensitive_env_name(name):
@@ -633,15 +719,52 @@ class Codini:
         }
 
     def redact_text(self, text):
-        """  将文字中出现的敏感变量实际值替换为 "<redacted>" """
+        """  将文字中出现的敏感信息（模式与特定值）实际值替换为 "<redacted>" """
         text = str(text)
+
+        # 1. Regex 模式扫描（防范未注册环境变量的 API Key 泄露）
+        high_confidence_patterns = [
+            re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+            re.compile(r"\b(ghp|xoxb|xoxp|live|test|sk_live|sk_test)_[A-Za-z0-9]{20,}\b"),
+        ]
+        for pattern in high_confidence_patterns:
+            text = pattern.sub(REDACTED_VALUE, text)
+
+        # 2. 保护性值脱敏：敏感值长度必须大于 4，才全局替换，防止误杀短单词/数字
         for _, value in sorted(self.detected_secret_env_items(), key=lambda item: len(item[1]), reverse=True):
-            text = text.replace(value, REDACTED_VALUE)
+            if len(str(value)) > 4:
+                text = text.replace(value, REDACTED_VALUE)
         return text
 
     def redact_artifact(self, value, key = None):
-        if key and self.is_secret_env_name(key):
+        # 3. 敏感键名字典层级精准替换。这里只处理真正的凭证字段，不要误伤 token 统计类指标。
+        is_sensitive_key = False
+        if key:
+            key_lower = str(key).lower()
+            sensitive_exact_keys = {
+                "api_key",
+                "apikey",
+                "access_token",
+                "refresh_token",
+                "auth_token",
+                "authorization",
+                "password",
+                "secret",
+                "token",
+            }
+            sensitive_suffixes = (
+                "_api_key",
+                "_apikey",
+                "_password",
+                "_secret",
+                "_token",
+            )
+            if self.is_secret_env_name(key) or key_lower in sensitive_exact_keys or key_lower.endswith(sensitive_suffixes):
+                is_sensitive_key = True
+
+        if is_sensitive_key:
             return REDACTED_VALUE
+
         if isinstance(value, dict):
             return {
                 str(item_key): self.redact_artifact(item_value, key=item_key)
@@ -671,6 +794,8 @@ class Codini:
         refresh = self.refresh_prefix()
         self.resume_state = self.evaluate_resume_state()
         prompt, metadata = self.context_manager.build(user_message)
+        prompt_cache_supported = bool(getattr(self.model_client, "supports_prompt_cache", False))
+        prompt_cache_key = self.prefix_state.hash if prompt_cache_supported else None
         metadata.update(
             {
                 "prefix_chars": len(self.prefix),
@@ -682,12 +807,14 @@ class Codini:
                 "workspace_docs": len(self.workspace.project_docs),
                 "recent_commits": len(self.workspace.recent_commits),
                 "prefix_hash": self.prefix_state.hash,
-                "prompt_cache_key": self.prefix_state.hash,
+                "prompt_cache_key": prompt_cache_key,
+                "prompt_cache_requested": bool(prompt_cache_key),
+                "prompt_cache_retention": "in_memory" if prompt_cache_key else None,
                 "workspace_fingerprint": self.prefix_state.workspace_fingerprint,
                 "tool_signature": self.prefix_state.tool_signature,
                 "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
-                "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
+                "prompt_cache_supported": prompt_cache_supported,
                 "resume_status": self.resume_state.get("status", CHECKPOINT_NONE_STATUS),
                 "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
@@ -696,45 +823,6 @@ class Codini:
         )
         metadata.update(self.detected_secret_env_summary())
         return prompt, metadata
-    
-    def emit_trace(self, task_state, event, payload=None):
-        """向当前运行的 trace 文件写入一条带时间戳的事件记录。
-
-        每条 trace event 会被自动注入一段 `inherited` 元数据，包括：
-        - 父子层级 (agent_rope / parent_run_id / depth)
-        - run 级共享字段 (approval_policy / read_only / sandbox / model / provider)
-        - 事件顺序信息 (event_index / created_inherited_fields)
-
-        这样：
-        - viewer 渲染单条 event 时无需回头翻 task_state.json
-        - 从父 trace 跳到子 trace 时能立刻拿到调用者的环境信息
-        - 索引里的 run 摘要和 trace 里的每个 event 是对齐的
-        """
-        payload = dict(self.redact_artifact(payload or {}))
-        payload["event"] = event
-        payload["created_at"] = now()
-        if event == "checkpoint_created":
-            checkpoint_id = payload.get("checkpoint_id")
-            if checkpoint_id:
-                state = self.checkpoint_state()
-                ckpt = state.get("items", {}).get(checkpoint_id)
-                if ckpt:
-                    payload.update({
-                        "current_goal": ckpt.get("current_goal", ""),
-                        "current_blocker": ckpt.get("current_blocker", ""),
-                        "next_step": ckpt.get("next_step", ""),
-                        "key_files": [kf.get("path") for kf in ckpt.get("key_files", []) if kf.get("path")],
-                    })
-        event_index = _count_run_events(self.run_store.trace_path(task_state))
-        payload["event_index"] = event_index
-
-        inherited = _build_trace_inherited(task_state)
-        payload["inherited"] = inherited
-        payload["created_inherited_fields"] = sorted(inherited.keys())
-
-        self.run_store.append_trace(task_state, payload)
-
-        return payload
 
     def _complete_with_heartbeat(self, prompt, prompt_cache_key, prompt_cache_retention):
         model_started_at = time.monotonic()
@@ -749,9 +837,7 @@ class Codini:
             err_msg = str(e)
             if "read operation timed out" in err_msg or "timeout" in err_msg.lower():
                 err_msg = f"LLM API request timed out (network read operation timed out). The model provider is likely overloaded: {e}"
-            if self.trace:
-                self.trace.on_run_error(f"model call failed: {err_msg}")
-            raise
+            raise RuntimeError(err_msg) from e
         model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
         return raw
 
@@ -789,7 +875,7 @@ class Codini:
         accum["latency"]["tool_ms"] += int(duration_ms or 0)
         accum["latency"]["count_tool"] += 1
 
-    def record_run_summary(self, task_state):
+    def record_run_summary(self, task_state, write_task_state=True, trigger="summary_updated", related_span_id="", related_event=""):
         """根据运行中的累加器，算一份 viewer 可渲染的聚合小计。
 
         聚合小计包括：
@@ -822,7 +908,14 @@ class Codini:
         task_state.summary = summary
         self.session.setdefault("_run_summaries", {})[task_state.run_id] = summary
         try:
-            self.run_store.record_run_summary(task_state, summary)
+            self.run_store.record_run_summary(
+                task_state,
+                summary,
+                write_task_state=write_task_state,
+                trigger=trigger,
+                related_span_id=related_span_id,
+                related_event=related_event,
+            )
         except Exception:
             # 聚合小计只是 viewer 的锦上添花；写坏了也不应该阻塞主流程。
             pass
@@ -873,7 +966,7 @@ class Codini:
                 diff_type = "created"
             elif path not in after_snapshot:
                 diff_type = "deleted"
-            
+
             try:
                 if diff_type == "deleted":
                     if rel_target_path == path and before_content is not None:
@@ -912,7 +1005,7 @@ class Codini:
                                 git_diff_success = True
                         except Exception:
                             pass
-                    
+
                     if not git_diff_success:
                         if rel_target_path == path and before_content is not None:
                             if p.is_file():
@@ -926,7 +1019,7 @@ class Codini:
                                 diff_text = "".join(diff_lines)
             except Exception as diff_exc:
                 diff_text = f"Error generating diff: {diff_exc}"
-            
+
             diffs.append({
                 "path": path,
                 "type": diff_type,
@@ -1087,11 +1180,9 @@ class Codini:
         `run_tool()` 执行动作
         """
         run_started_at = time.monotonic()
+        self._trace_started_at = run_started_at
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
-
-        if self.trace:
-            self.trace.on_run_start(user_message)
 
         task_state = TaskState.create(
             run_id=self.new_run_id(),
@@ -1099,6 +1190,7 @@ class Codini:
             user_request=user_message,
             parent_run_id=getattr(self, "parent_run_id", ""),
             parent_tool_event_index=getattr(self, "parent_tool_event_index", -1),
+            parent_span_id=getattr(self, "parent_span_id", ""),
             agent_rope=getattr(self, "agent_rope", ""),
         )
         task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
@@ -1110,15 +1202,15 @@ class Codini:
         task_state.model = seed.get("model", "")
         task_state.provider = seed.get("provider", "")
         task_state.depth = int(getattr(self, "depth", 0) or 0)
-        # run 级共享字段也存到 task_state，viewer 直接读取 task_state.json 也能拿到
         task_state._run_inherited = dict(seed)
         task_state._run_inherited["depth"] = task_state.depth
         task_state._run_inherited["read_only"] = task_state.read_only
         task_state._run_inherited["agent_rope"] = task_state.agent_rope
         task_state._run_inherited["session_id"] = task_state.session_id
+        task_state._run_inherited["parent_span_id"] = task_state.parent_span_id
+        task_state._trace_started_at = run_started_at
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
-        # 累加器：运行中的 tokens / latency / tools，写 summary 时直接用，不必扫 trace。
         self._run_accum = {
             "tokens": {"prompt": 0, "completion": 0, "total": 0, "cached": 0},
             "latency": {
@@ -1129,295 +1221,419 @@ class Codini:
             },
             "tools": {},
         }
-        self.emit_trace(
-            task_state,
-            "run_started",
-            {
-                "task_id": task_state.task_id,
-                "user_request": clip(user_message, 300),
-            },
-        )
+
+        self.span_exporter = FileSpanExporter(self)
+        self.tracer.register_processor(self.span_exporter)
+
+        run_span = self.tracer.start_span("agent.ask", {
+            "trace_id": task_state.run_id,
+            "parent_span_id": task_state.parent_span_id,
+            "depth": task_state.depth,
+            "task_id": task_state.task_id,
+            "user_request": user_message
+        })
+        run_span_token = self.tracer._active_span_var.set(run_span)
 
         tool_steps = 0
         attempts = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
+        pending_error = None
 
-        # Agent 运行时的主循环
-        # 1. 感知：重组 Prompt，把当前状态整理给模型看
-        # 2. 决策：让模型返回一个工具调用，或一个最终答案
-        # 3. 行动：如果是工具调用，就执行工具
-        # 4. 记录：把结果写回 history / task_state / trace / memory
-        # 然后进入下一轮，直到停机条件满足
-        while tool_steps < self.max_steps and attempts < max_attempts:
-            attempts += 1
-            task_state.record_attempt()
-            self.run_store.write_task_state(task_state)
-            prompt_started_at = time.monotonic()
-            prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
-            self.emit_trace(
-                task_state,
-                "prompt_built",
-                {
-                    "prompt_metadata": prompt_metadata,
-                    "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
-                }
-            )
-            if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger = "freshness_mismatch")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
+        try:
+            # Agent 运行时的主循环
+            # 1. 感知：重组 Prompt，把当前状态整理给模型看
+            # 2. 决策：让模型返回一个工具调用，或一个最终答案
+            # 3. 行动：如果是工具调用，就执行工具
+            # 4. 记录：把结果写回 history / task_state / trace / memory
+            # 然后进入下一轮，直到停机条件满足
+            while tool_steps < self.max_steps and attempts < max_attempts:
+                attempts += 1
+                task_state.record_attempt()
+                self.run_store.write_task_state(
                     task_state,
-                    "checkpoint_created",
+                    trigger="attempt_started",
+                    related_span_id=run_span.span_id,
+                    related_event="model_requested",
+                )
+                prompt_started_at = time.monotonic()
+                prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
+                redacted_prompt = self.redact_artifact(prompt)
+                redacted_prompt_without_current_request = self.redact_artifact(
+                    prompt_metadata.get("prompt_without_current_request", "")
+                )
+                prompt_metadata_for_trace = dict(prompt_metadata)
+                prompt_metadata_for_trace.pop("prompt_without_current_request", None)
+                run_span.add_event(
+                    "prompt_built",
                     {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "freshness_mismatch",
+                        "prompt_metadata": prompt_metadata_for_trace,
+                        "prompt": redacted_prompt,
+                        "prompt_without_current_request": redacted_prompt_without_current_request,
+                        "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                     }
                 )
-            elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
-                self.emit_trace(
-                    task_state,
-                    "runtime_identity_mismatch",
-                    {
-                        "fields": list(prompt_metadata.get("runtime_identity_mismatch_fields", [])),
-                    },
-                )
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="workspace_mismatch")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "workspace_mismatch",
-                    },
-                )
+                if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
+                    checkpoint = self.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="freshness_mismatch",
+                        related_span_id=run_span.span_id,
+                        related_event="checkpoint_created",
+                    )
+                    run_span.add_event(
+                        "checkpoint_created",
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "trigger": "freshness_mismatch",
+                        }
+                    )
+                elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
+                    run_span.add_event(
+                        "runtime_identity_mismatch",
+                        {
+                            "fields": list(prompt_metadata.get("runtime_identity_mismatch_fields", [])),
+                        },
+                    )
+                    checkpoint = self.create_checkpoint(task_state, user_message, trigger="workspace_mismatch")
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="workspace_mismatch",
+                        related_span_id=run_span.span_id,
+                        related_event="checkpoint_created",
+                    )
+                    run_span.add_event(
+                        "checkpoint_created",
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "trigger": "workspace_mismatch",
+                        },
+                    )
 
-            if prompt_metadata.get("budget_reductions"):
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="context_reduction")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "context_reduction",
-                    },
-                )
-            self.emit_trace(
-                task_state,
-                "model_requested",
-                {
+                if prompt_metadata.get("budget_reductions"):
+                    checkpoint = self.create_checkpoint(task_state, user_message, trigger="context_reduction")
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="context_reduction",
+                        related_span_id=run_span.span_id,
+                        related_event="checkpoint_created",
+                    )
+                    run_span.add_event(
+                        "checkpoint_created",
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "trigger": "context_reduction",
+                        },
+                    )
+                prompt_cache_key = None
+                prompt_cache_retention = None
+                if getattr(self.model_client, "supports_prompt_cache", False):
+                    prompt_cache_key = prompt_metadata.get("prompt_cache_key")
+                    prompt_cache_retention = "in_memory"
+                prompt_metadata["prompt_cache_key"] = prompt_cache_key
+                prompt_metadata["prompt_cache_requested"] = bool(prompt_cache_key)
+                prompt_metadata["prompt_cache_retention"] = prompt_cache_retention
+                self.last_prompt_metadata = {
+                    key: value for key, value in prompt_metadata.items()
+                    if key != "prompt_without_current_request"
+                }
+                self.last_completion_metadata = {}
+
+                llm_attrs = {
                     "attempts": task_state.attempts,
                     "tool_steps": task_state.tool_steps,
-                    "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
-                    "prompt_chars": int(prompt_metadata.get("prefix_chars", 0) or 0) + int(prompt_metadata.get("request_chars", 0) or 0),
-                },
-            )
+                    "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
+                    "prompt_cache_requested": bool(prompt_cache_key),
+                    "prompt_cache_key": prompt_cache_key,
+                    "prompt_cache_retention": prompt_cache_retention,
+                    "prompt_chars": int(prompt_metadata.get("prompt_chars", len(prompt)) or len(prompt)),
+                    "prompt": redacted_prompt,
+                }
 
-            prompt_cache_key = None
-            prompt_cache_retention = None
-            if getattr(self.model_client, "supports_prompt_cache", False):
-                prompt_cache_key = prompt_metadata.get("prompt_cache_key")
-                prompt_cache_retention = "in_memory"
+                with self.tracer.span_scope("llm.complete", llm_attrs) as llm_span:
+                    model_started_at = time.monotonic()
+                    raw = self._complete_with_heartbeat(prompt, prompt_cache_key, prompt_cache_retention)
+                    model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
 
-            if self.trace:
-                self.trace.on_thinking_start(attempts, self.max_steps)
-
-            model_started_at = time.monotonic()
-            raw = self._complete_with_heartbeat(prompt, prompt_cache_key, prompt_cache_retention)
-            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
-
-            if self.trace:
-                self.trace.on_thinking_end(model_duration_ms)
-
-            completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
-            if completion_metadata:
-                # 把后端返回的 usage/cache 统计并回 prompt_metadata，方便统一写入 report 和 trace。
-                prompt_metadata.update(completion_metadata)
-            self.last_completion_metadata = completion_metadata
-            self.last_prompt_metadata = prompt_metadata
-            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
-            # 累加 tokens / model latency，用于 viewer 的聚合卡片
-            self._accum_model(completion_metadata, duration_ms=model_duration_ms)
-            # 完全拿到模型的回复后去解析生成内容
-            kind, payload = self.parse(raw)
-
-            self.emit_trace(
-                task_state,
-                "model_parsed",
-                {
-                    "kind": kind,
-                    "raw": clip(raw, 600),
-                    "duration_ms": model_duration_ms,
-                    **_extract_run_usage_fields(completion_metadata),
-                },
-            )
-            if kind == "tool":
-                tool_steps += 1
-                name = payload.get("name", "")
-                args = payload.get("args", {})
-                task_state.record_tool(name)
-                risky = bool(self.tools.get(name, {}).get("risky", False))
-
-                if self.trace:
-                    self.trace.on_tool_call(name, args, risky)
-
-                tool_started_at = time.monotonic()
-                result = self.run_tool(name, args)
-                tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
-
-                tool_status = (self._last_tool_result_metadata or {}).get("tool_status", "ok")
-                success = tool_status not in ("error", "rejected", "partial_success")
-
-                if self.trace:
-                    self.trace.on_tool_result(name, result, tool_duration_ms, success)
-
-                # 累加 tool 耗时 / tools 表，用于 viewer 的聚合卡片
-                self._accum_tool(name, duration_ms=tool_duration_ms)
-                self.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
+                    completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
+                    if completion_metadata:
+                        for key, value in completion_metadata.items():
+                            if value is not None:
+                                prompt_metadata[key] = value
+                        usage_fields = _extract_run_usage_fields(completion_metadata)
+                        prompt_metadata["provider_cache_hit"] = usage_fields["cache_hit"]
+                        prompt_metadata["provider_cached_tokens"] = usage_fields["cached_tokens"]
+                    self.last_completion_metadata = completion_metadata
+                    self.last_prompt_metadata = {
+                        key: value for key, value in prompt_metadata.items()
+                        if key != "prompt_without_current_request"
                     }
-                )
-                self.run_store.write_task_state(task_state)
-                tool_result_meta = dict(self._last_tool_result_metadata or {})
-                exit_code = tool_result_meta.get("exit_code")
-                if exit_code is None and name == "run_shell":
-                    match = re.search(r"exit_code:\s*(-?\d+)", result)
-                    exit_code = int(match.group(1)) if match else 0
-                security_event = tool_result_meta.get("security_event_type") or ""
-                # 最近一次失败/拒绝的完整原文，viewer 渲染时能直接看到错误全貌。
-                full_error = ""
-                if tool_result_meta.get("tool_status") in {"error", "partial_success", "rejected"}:
-                    full_error = str(result or "")
-                self.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {
+                    model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
+                    self._accum_model(completion_metadata, duration_ms=model_duration_ms)
+                    kind, payload = self.parse(raw)
+
+                    llm_span.set_attributes({
+                        "kind": kind,
+                        "raw": clip(raw, 600),
+                        **_extract_run_usage_fields(completion_metadata),
+                    })
+                if kind == "tool":
+                    tool_steps += 1
+                    name = payload.get("name", "")
+                    args = payload.get("args", {})
+                    task_state.record_tool(name)
+                    risky = bool(self.tools.get(name, {}).get("risky", False))
+
+                    tool_attrs = {
                         "name": name,
                         "args": args,
-                        "result": clip(result, 800),
-                        "result_full": full_error or clip(result, 2000),
-                        "full_error": full_error,
-                        "duration_ms": tool_duration_ms,
-                        "exit_code": exit_code,
-                        "security_event_type": security_event,
-                        "risk_level": tool_result_meta.get("risk_level"),
-                        "workspace_changed": tool_result_meta.get("workspace_changed"),
-                        "affected_paths": tool_result_meta.get("affected_paths"),
-                        "tool_status": tool_result_meta.get("tool_status"),
-                        "tool_error_code": tool_result_meta.get("tool_error_code"),
-                        "diffs": tool_result_meta.get("diffs", []),
-                    },
-                )
+                        "risky": risky,
+                        "risk_level": "high" if risky else "low",
+                    }
 
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "tool_executed",
-                    },
-                )
-                continue
+                    with self.tracer.span_scope(f"tool.{name or 'unknown'}", tool_attrs) as tool_span:
+                        tool_started_at = time.monotonic()
+                        self.current_tool_span_id = tool_span.span_id
+                        try:
+                            result = self.run_tool(name, args)
+                        finally:
+                            self.current_tool_span_id = ""
+                        tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
 
-            if kind == "retry":
-                self.record({"role": "assistant", "content": payload, "created_at": now()})
-                self.run_store.write_task_state(task_state)
-                if self.trace:
-                    self.trace.on_response_correction(attempts)
-                continue
-            final = (payload or raw).strip()
-            self.record({"role": "assistant", "content": final, "created_at": now()})
-            task_state.finish_success(final)
-            self.promote_durable_memory(user_message, final)
+                        tool_status = (self._last_tool_result_metadata or {}).get("tool_status", "ok")
+                        success = tool_status not in ("error", "rejected", "partial_success")
 
-            if self.trace:
-                total_duration_ms = int((time.monotonic() - run_started_at) * 1000)
-                tools_trace = []
+                        self._accum_tool(name, duration_ms=tool_duration_ms)
+                        self.record(
+                            {
+                                "role": "tool",
+                                "name": name,
+                                "args": args,
+                                "content": result,
+                                "created_at": now(),
+                            }
+                        )
+                        self.run_store.write_task_state(
+                            task_state,
+                            trigger="tool_executed",
+                            related_span_id=tool_span.span_id,
+                            related_event="tool_executed",
+                        )
+                        tool_result_meta = dict(self._last_tool_result_metadata or {})
+                        exit_code = tool_result_meta.get("exit_code")
+                        if exit_code is None and name == "run_shell":
+                            match = re.search(r"exit_code:\s*(-?\d+)", result)
+                            exit_code = int(match.group(1)) if match else 0
+                        security_event = tool_result_meta.get("security_event_type") or ""
+                        full_error = ""
+                        if tool_result_meta.get("tool_status") in {"error", "partial_success", "rejected"}:
+                            full_error = str(result or "")
+
+                        tool_span.set_attributes({
+                            "name": name,
+                            "args": args,
+                            "result": clip(result, 800),
+                            "result_full": full_error or clip(result, 2000),
+                            "full_error": full_error,
+                            "exit_code": exit_code,
+                            "security_event_type": security_event,
+                            "risk_level": tool_result_meta.get("risk_level"),
+                            "approval_policy": tool_result_meta.get("approval_policy"),
+                            "approved": tool_result_meta.get("approved"),
+                            "workspace_changed": tool_result_meta.get("workspace_changed"),
+                            "affected_paths": tool_result_meta.get("affected_paths"),
+                            "tool_status": tool_result_meta.get("tool_status"),
+                            "tool_error_code": tool_result_meta.get("tool_error_code"),
+                            "child_session_id": tool_result_meta.get("child_session_id"),
+                            "child_run_id": tool_result_meta.get("child_run_id"),
+                            "child_trace_id": tool_result_meta.get("child_trace_id"),
+                            "diffs": tool_result_meta.get("diffs", []),
+                            "success": success
+                        })
+
+                    checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="checkpoint_created",
+                        related_span_id=run_span.span_id,
+                        related_event="checkpoint_created",
+                    )
+                    run_span.add_event(
+                        "checkpoint_created",
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "trigger": "tool_executed",
+                        },
+                    )
+                    continue
+
+                if kind == "retry":
+                    self.record({"role": "assistant", "content": payload, "created_at": now()})
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="response_correction",
+                        related_span_id=run_span.span_id,
+                        related_event="response_correction",
+                    )
+                    run_span.add_event("response_correction", {"attempt": attempts})
+                    continue
+                final = (payload or raw).strip()
+                self.record({"role": "assistant", "content": final, "created_at": now()})
+                task_state.finish_success(final)
+                self.promote_durable_memory(user_message, final)
+
+                tools_viz = []
                 tool_count = task_state.tool_steps
                 for item in self.session["history"][-(tool_count + 1):]:
                     if item.get("role") == "tool":
-                        tools_trace.append({
+                        tools_viz.append({
                             "name": item.get("name", ""),
                             "success": True,
                             "summary": "",
                             "duration_ms": 0,
                         })
-                if tools_trace:
-                    tools_trace[0]["duration_ms"] = self._run_accum["latency"]["tool_ms"]
-                self.trace.on_answer(
-                    final,
-                    list(self.last_durable_promotions),
-                    list(self.last_durable_rejections),
-                    tools_trace,
-                    total_duration_ms,
-                    self.last_prompt_metadata,
-                    self.last_completion_metadata,
-                )
+                if tools_viz:
+                    tools_viz[0]["duration_ms"] = self._run_accum["latency"]["tool_ms"]
 
-            checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
-            self.run_store.write_task_state(task_state)
-            self.emit_trace(
-                task_state,
-                "checkpoint_created",
-                {
-                    "checkpoint_id": checkpoint["checkpoint_id"],
-                    "trigger": "run_finished",
-                },
-            )
-            self.emit_trace(
-                task_state,
-                "run_finished",
-                {
+                checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
+                self.record_run_summary(
+                    task_state,
+                    write_task_state=False,
+                    trigger="run_finished",
+                    related_span_id=run_span.span_id,
+                    related_event="run_finished",
+                )
+                self.run_store.write_task_state(
+                    task_state,
+                    trigger="run_finished",
+                    related_span_id=run_span.span_id,
+                    related_event="run_finished",
+                )
+                run_span.add_event(
+                    "checkpoint_created",
+                    {
+                        "checkpoint_id": checkpoint["checkpoint_id"],
+                        "trigger": "run_finished",
+                    },
+                )
+                run_span.set_attributes({
                     "status": task_state.status,
                     "stop_reason": task_state.stop_reason,
                     "final_answer": final,
-                    "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
+                    "promotions": list(self.last_durable_promotions),
+                    "rejections": list(self.last_durable_rejections),
+                    "tools_summary": tools_viz,
+                    "prompt_metadata": self.last_prompt_metadata,
+                    "completion_metadata": self.last_completion_metadata
+                })
+                self.run_store.write_report(
+                    task_state,
+                    self.redact_artifact(self.build_report(task_state)),
+                    trigger="run_finished",
+                    related_span_id=run_span.span_id,
+                    related_event="run_finished",
+                )
+                run_span.finish()
+                return final
+
+            if attempts >= max_attempts and tool_steps < self.max_steps:
+                final = "Stopped after too many malformed model responses without a valid tool call or final answer."
+                task_state.stop_retry_limit(final)
+            else:
+                final = "Stopped after reaching the step limit without a final answer."
+                task_state.stop_step_limit(final)
+
+            self.record({"role": "assistant", "content": final, "created_at": now()})
+            self.promote_durable_memory(user_message, final)
+            self.record_run_summary(
+                task_state,
+                write_task_state=False,
+                trigger=task_state.stop_reason or "run_stopped",
+                related_span_id=run_span.span_id,
+                related_event="run_finished",
+            )
+            self.run_store.write_task_state(
+                task_state,
+                trigger=task_state.stop_reason or "run_stopped",
+                related_span_id=run_span.span_id,
+                related_event="run_finished",
+            )
+            checkpoint = self.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
+            run_span.add_event(
+                "checkpoint_created",
+                {
+                    "checkpoint_id": checkpoint["checkpoint_id"],
+                    "trigger": task_state.stop_reason or "run_stopped",
                 },
             )
-            self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
-            self.record_run_summary(task_state)
-            return final
-
-        if attempts >= max_attempts and tool_steps < self.max_steps:
-            final = "Stopped after too many malformed model responses without a valid tool call or final answer."
-            task_state.stop_retry_limit(final)
-        else:
-            final = "Stopped after reaching the step limit without a final answer."
-            task_state.stop_step_limit(final)
-
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.promote_durable_memory(user_message, final)
-        self.run_store.write_task_state(task_state)
-        checkpoint = self.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
-        self.emit_trace(
-            task_state,
-            "checkpoint_created",
-            {
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "trigger": task_state.stop_reason or "run_stopped",
-            },
-        )
-        self.emit_trace(
-            task_state,
-            "run_finished",
-            {
+            run_span.set_attributes({
                 "status": task_state.status,
                 "stop_reason": task_state.stop_reason,
                 "final_answer": final,
-                "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
-            },
-        )
-        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
-        self.record_run_summary(task_state)
-        return final
+                "promotions": list(self.last_durable_promotions),
+                "rejections": list(self.last_durable_rejections),
+                "tools_summary": [],
+                "prompt_metadata": self.last_prompt_metadata,
+                "completion_metadata": self.last_completion_metadata
+            })
+            self.run_store.write_report(
+                task_state,
+                self.redact_artifact(self.build_report(task_state)),
+                trigger=task_state.stop_reason or "run_stopped",
+                related_span_id=run_span.span_id,
+                related_event="run_finished",
+            )
+            run_span.finish()
+            return final
+        except Exception as exc:
+            pending_error = exc
+            if getattr(task_state, "stop_reason", "") == "":
+                task_state.stop_runtime_error(str(exc))
+            error_info = self.build_error_info(exc, task_state.stop_reason)
+            task_state.error = error_info
+            task_state._error_info = error_info
+            self.record_error_response(task_state, exc, error_info=error_info)
+            run_span.set_attributes({
+                "status": task_state.status or "failed",
+                "stop_reason": task_state.stop_reason or "runtime_error",
+                "final_answer": task_state.final_answer,
+                "error": str(exc),
+                "error_info": error_info,
+                **error_info,
+                "prompt_metadata": self.last_prompt_metadata,
+                "completion_metadata": self.last_completion_metadata,
+            })
+            try:
+                self.record_run_summary(
+                    task_state,
+                    write_task_state=False,
+                    trigger=task_state.stop_reason or "runtime_error",
+                    related_span_id=run_span.span_id,
+                    related_event="run_finished",
+                )
+                self.run_store.write_task_state(
+                    task_state,
+                    trigger=task_state.stop_reason or "runtime_error",
+                    related_span_id=run_span.span_id,
+                    related_event="run_finished",
+                )
+                self.run_store.write_report(
+                    task_state,
+                    self.redact_artifact(self.build_report(task_state)),
+                    trigger=task_state.stop_reason or "runtime_error",
+                    related_span_id=run_span.span_id,
+                    related_event="run_finished",
+                )
+            except Exception:
+                pass
+            raise
+        finally:
+            if run_span.end_time is None:
+                run_span.finish(status="ERROR" if pending_error else "OK")
+            if run_span_token is not None:
+                self.tracer._active_span_var.reset(run_span_token)
+            self.tracer.unregister_processor(self.span_exporter)
+            self.span_exporter = None
+            self.current_tool_span_id = ""
 
     def run_tool(self, name, args):
         """
@@ -1471,13 +1687,38 @@ class Codini:
                 "diff_summary": [],
             }
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
-        if tool["risky"] and not self.approve(name, args):
+        approved = True
+        if tool["risky"]:
+            approval_span = self.tracer.get_current_span() if hasattr(self, "tracer") else None
+            if approval_span:
+                approval_span.add_event(
+                    "approval_requested",
+                    {
+                        "name": name,
+                        "approval_policy": self.approval_policy,
+                        "read_only": self.read_only,
+                    },
+                )
+            approved = self.approve(name, args)
+            if approval_span:
+                approval_span.add_event(
+                    "approval_result",
+                    {
+                        "name": name,
+                        "approval_policy": self.approval_policy,
+                        "approved": approved,
+                        "denial_reason": "" if approved else ("read_only_block" if self.read_only else "approval_denied"),
+                    },
+                )
+        if tool["risky"] and not approved:
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "approval_denied",
                 "security_event_type": "read_only_block" if self.read_only else "approval_denied",
                 "risk_level": "high",
-                "read_only": False,
+                "approval_policy": self.approval_policy,
+                "approved": False,
+                "read_only": self.read_only,
                 "affected_paths": [],
                 "workspace_changed": False,
                 "diff_summary": [],
@@ -1499,6 +1740,8 @@ class Codini:
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
+            if name == "delegate":
+                self._last_delegate_child_info = {}
             result = clip(tool["run"](args))
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
@@ -1516,17 +1759,24 @@ class Codini:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
             self.update_memory_after_tool(name, args, result)
+            child_info = {}
+            if name == "delegate":
+                child_info = dict(getattr(self, "_last_delegate_child_info", {}) or {})
+                self._last_delegate_child_info = {}
             self._last_tool_result_metadata = {
                 "tool_status": tool_status,
                 "tool_error_code": tool_error_code,
                 "security_event_type": "",
                 "risk_level": "high" if tool["risky"] else "low",
+                "approval_policy": self.approval_policy,
+                "approved": approved,
                 "read_only": not tool["risky"],
                 "affected_paths": affected_paths,
                 "workspace_changed": workspace_changed,
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
                 "diffs": diffs,
+                **child_info,
             }
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
@@ -1541,6 +1791,8 @@ class Codini:
                 "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
                 "security_event_type": security_event_type,
                 "risk_level": "high" if tool["risky"] else "low",
+                "approval_policy": self.approval_policy,
+                "approved": approved,
                 "read_only": not tool["risky"],
                 "affected_paths": affected_paths,
                 "workspace_changed": workspace_changed,
@@ -1573,16 +1825,20 @@ class Codini:
         # report 是一次运行的最终摘要；和 trace 的区别在于，trace 关注过程，report 关注结果与关键指标。
         return {
             "run_id": task_state.run_id,
+            "trace_id": task_state.run_id,
+            "session_id": task_state.session_id,
             "task_id": task_state.task_id,
             "status": task_state.status,
             "stop_reason": task_state.stop_reason,
             "final_answer": task_state.final_answer,
             "tool_steps": task_state.tool_steps,
             "attempts": task_state.attempts,
+            "summary": task_state.summary,
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
+            "error": dict(getattr(task_state, "error", {}) or {}),
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
@@ -1675,6 +1931,11 @@ class Codini:
             if payload is not None:
                 return "tool", payload
             return "retry", Codini.retry_notice()
+        if "<longcat_tool_call>" in raw and ("<final>" not in raw or raw.find("<longcat_tool_call>") < raw.find("<final>")):
+            payload = Codini.parse_longcat_tool_call(raw)
+            if payload is not None:
+                return "tool", payload
+            return "retry", Codini.retry_notice("model returned malformed LongCat tool call")
         if "<final>" in raw:
             final = Codini.extract(raw, "final").strip()
             if final:
@@ -1721,6 +1982,53 @@ class Codini:
         if name == "delegate" and "task" not in args and body_text:
             args["task"] = body_text.strip()
         return {"name": name, "args": args}
+
+    @staticmethod
+    def parse_longcat_tool_call(raw):
+        # TODO: remove this experimental LongCat compatibility once provider output is normalized upstream.
+        match = re.search(r"<longcat_tool_call>(?P<body>.*?)(?:</longcat_tool_call>|$)", str(raw), re.S)
+        if not match:
+            return None
+        body = match.group("body").strip()
+        body = re.sub(r"/\s*$", "", body).strip()
+        call_match = re.match(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>.*)\)\s*$", body, re.S)
+        if call_match:
+            name = call_match.group("name")
+            args_text = call_match.group("args")
+        else:
+            attr_match = re.match(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<args>.*)$", body, re.S)
+            if not attr_match:
+                return None
+            name = attr_match.group("name")
+            args_text = attr_match.group("args")
+        args = Codini.parse_call_args(args_text)
+        return {"name": name, "args": args}
+
+    @staticmethod
+    def parse_call_args(text):
+        args = {}
+        pattern = re.compile(
+            r"""(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^,\s]+)"""
+        )
+        for match in pattern.finditer(str(text)):
+            value = match.group("value").strip()
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                try:
+                    value = json.loads(value) if value.startswith('"') else value[1:-1].replace("\\'", "'")
+                except Exception:
+                    value = value[1:-1]
+            elif re.fullmatch(r"-?\d+", value):
+                value = int(value)
+            elif re.fullmatch(r"-?\d+\.\d+", value):
+                value = float(value)
+            elif value.lower() == "true":
+                value = True
+            elif value.lower() == "false":
+                value = False
+            elif value.lower() == "none" or value.lower() == "null":
+                value = None
+            args[match.group("key")] = value
+        return args
 
     @staticmethod
     def parse_attrs(text):

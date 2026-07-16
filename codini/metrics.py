@@ -87,9 +87,39 @@ def _infer_run_duration_ms(events):
     return max(0.0, (end_at - start_at).total_seconds() * 1000.0)
 
 
+def _iter_jsonl(path):
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    continue
+    except OSError:
+        return
+
+
 def aggregate_run_artifacts(runs_root):
     runs_root = Path(runs_root)
-    run_dirs = sorted(path for path in runs_root.glob("*") if path.is_dir())
+    sessions_dir = runs_root.parent / "sessions" if runs_root.name == "runs" else runs_root
+    reports_by_run = {}
+    for history_path in sorted(sessions_dir.glob("*/report_history.jsonl"), key=lambda path: path.stat().st_mtime):
+        for entry in _iter_jsonl(history_path):
+            run_id = str(entry.get("run_id", "")).strip()
+            if run_id:
+                reports_by_run[run_id] = entry
+    if not reports_by_run:
+        for report_path in sorted(sessions_dir.glob("*/report.json"), key=lambda path: path.stat().st_mtime):
+            try:
+                report_data = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            run_id = str(report_data.get("run_id", "")).strip()
+            if run_id:
+                reports_by_run[run_id] = report_data
+
     reports = []
     tool_status_counts = {}
     tool_name_counts = {}
@@ -99,15 +129,17 @@ def aggregate_run_artifacts(runs_root):
     prompt_durations = []
     stop_reasons = {}
 
-    for run_dir in run_dirs:
-        report_path = run_dir / "report.json"
-        trace_path = run_dir / "trace.jsonl"
-        if report_path.exists():
-            reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+    for report_data in reports_by_run.values():
+        reports.append(report_data)
+        run_id = str(report_data.get("run_id", "")).strip()
+        session_id = str(report_data.get("session_id") or report_data.get("task_state", {}).get("session_id", "")).strip()
+        trace_path = sessions_dir / session_id / "trace.jsonl"
 
-        events = []
-        if trace_path.exists():
-            events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        events = [
+            event
+            for event in _iter_jsonl(trace_path)
+            if event.get("trace_id") == run_id
+        ]
 
         run_durations.append(_infer_run_duration_ms(events))
         for event in events:
@@ -118,7 +150,7 @@ def aggregate_run_artifacts(runs_root):
             tool_name = str(event.get("name","")).strip()
             if tool_name:
                 tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
-            tool_status = str(event.get("status","")).strip()
+            tool_status = str(event.get("tool_status") or event.get("status","")).strip()
             if tool_status:
                 tool_status_counts[tool_status] = tool_status_counts.get(tool_status, 0) + 1    
             security_event = str(event.get("security_event_type", "")).strip()
@@ -830,8 +862,7 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
     return {"providers": providers}
 
 def _followup_trace_metrics(agent):
-    trace_path = agent.run_store.trace_path(agent.current_task_state)
-    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    events = agent.run_store.load_trace_events(agent.current_task_state.run_id)
     # 统计 read_file 工具被调用的次数
     repeated_reads = sum(1 for event in events if event.get("event") == "tool_executed" and event.get("name") == "read_file")
     return repeated_reads
@@ -1554,10 +1585,7 @@ def _run_recovery_task_variant(task, variant):
             agent.session_store.save(agent.session)
         final_answer = agent.ask("Continue the recovery task.")
         report = agent.run_store.load_report(agent.current_task_state.run_id)
-        trace = [
-            json.loads(line)
-            for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
-        ]
+        trace = agent.run_store.load_trace_events(agent.current_task_state.run_id)
         resume_status = str(report.get("prompt_metadata", {}).get("resume_status", ""))
         stale_reanchored = any(
             event.get("event") == "checkpoint_created" and event.get("trigger") == "freshness_mismatch"

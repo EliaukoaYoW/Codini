@@ -404,7 +404,7 @@ class ContextManager:
         - 最近条目：保留完整内容（每条最多 10000 字符）
         - 较旧的 read_file：用记忆中的文件摘要替代，重复的直接丢弃
         - 较旧的其他工具：压缩成一行摘要
-        - 较旧的用户/助手消息：压缩到 500 字符
+        - 较旧的用户/助手消息：压缩到 60 字符
         输入: history（历史记录列表）、recent_start（最近记录起始索引）
         输出: 压缩后的历史记录列表 entries、压缩详情 details
         """
@@ -448,7 +448,7 @@ class ContextManager:
                 details["summarized_tool_count"] += 1
                 continue
             
-            entries.append({"recent": False, "lines": self._render_history_item(item, 500)})
+            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
         return entries, details
     
 
@@ -510,9 +510,10 @@ class ContextManager:
             prefix = f"[assistant] <tool>{{\"name\":\"{item['name']}\",\"args\":{json.dumps(item['args'], sort_keys=True)}}}</tool>"
             content = f"[system] Tool result:\n{_tail_clip(item['content'], max(20, line_limit))}"
             return [prefix, content]
-
+        
         content = item.get("content", "")
         if item["role"] == "assistant":
+            # 过滤历史遗留的 STATUS/STEPS_USED/FINDINGS，防止大模型在上下文里产生“回复模仿偏见”
             cleaned = []
             for line in content.splitlines():
                 stripped = line.strip()
@@ -525,7 +526,7 @@ class ContextManager:
             content = "\n".join(cleaned)
             
         return [f"[{item['role']}] {_tail_clip(content, line_limit)}"]
-
+    
     def _assemble_prompt(self, rendered: dict[str, SectionRender]) -> str:
         # 组装Prompt 其顺序是刻意设计的：稳定规则放前面，最新请求放最后。
         return "\n\n".join(
@@ -535,6 +536,16 @@ class ContextManager:
                 rendered["relevant_memory"].rendered,
                 rendered["history"].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
+            ]
+        ).strip()
+
+    def _assemble_prompt_without_current_request(self, rendered: dict[str, SectionRender]) -> str:
+        return "\n\n".join(
+            [
+                rendered["prefix"].rendered,
+                rendered["memory"].rendered,
+                rendered["relevant_memory"].rendered,
+                rendered["history"].rendered,
             ]
         ).strip()
 
@@ -561,8 +572,11 @@ class ContextManager:
             "budget_chars": None,
             "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
         }
+        prompt_without_current_request = self._assemble_prompt_without_current_request(rendered)
         return {
             "prompt_chars": len(prompt),
+            "prompt_without_current_request": prompt_without_current_request,
+            "prompt_without_current_request_chars": len(prompt_without_current_request),
             "prompt_budget_chars": self.total_budget,
             "prompt_over_budget": len(prompt) > self.total_budget,
             "section_order": list(SECTION_ORDER),
