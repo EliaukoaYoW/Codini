@@ -21,6 +21,7 @@ BASE_MASCOT_WIDTH = 40
 BASE_MASCOT_HEIGHT = 36
 MASCOT_WIDTH = 28
 MASCOT_HEIGHT = 18
+MASCOT_TOP_PADDING_ROWS = 1
 
 # Colors
 OUTLINE = "#334155"         # Slate-700
@@ -111,7 +112,7 @@ def mascot_visible_width() -> int:
 
 def render_mascot_plain_rows(fill: str = "[]", blank: str = "  ") -> tuple[str, ...]:
     """Fallback plain text representation of the mascot."""
-    rows = []
+    rows = [blank * MASCOT_WIDTH for _ in range(MASCOT_TOP_PADDING_ROWS)]
     for row in mascot_pixels():
         chunks = []
         for color in row:
@@ -150,6 +151,8 @@ def render_mascot_rich_text():
     from rich.style import Style
 
     text = Text()
+    if MASCOT_TOP_PADDING_ROWS:
+        text.append("\n" * MASCOT_TOP_PADDING_ROWS)
     pixels = mascot_stacked_rows()
     for row_idx, row in enumerate(pixels):
         for top_color, bottom_color in row:
