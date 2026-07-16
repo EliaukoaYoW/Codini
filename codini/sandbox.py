@@ -99,6 +99,8 @@ class BubblewrapSandbox(Sandbox):
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
                 env=env,  # bwrap 内部用 --clearenv + --setenv 控制
             )
         except subprocess.TimeoutExpired:
