@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import shutil
 import re
 from typing import Optional
@@ -113,6 +115,7 @@ def _extract_code_blocks(text: str) -> list[tuple[str, str]]:
 
 class RichTrace(TraceHooks):
     def __init__(self, console: Optional[Console] = None, max_result_chars: int = 600):
+        super().__init__()
         self.console = console or Console()
         self.max_result_chars = max_result_chars
         self._tools: list[dict] = []
@@ -121,31 +124,63 @@ class RichTrace(TraceHooks):
         self._spinner_idx = 0
         self._corrections = 0
         self._start_ms: int = 0
+        self.current_depth = 0
 
     def _next_spinner(self) -> str:
         ch = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
         self._spinner_idx += 1
         return ch
 
+    def _indent(self, spaces: int) -> str:
+        if self.current_depth <= 0:
+            return " " * spaces
+        parts = ["    [dim]│[/]   " * (self.current_depth - 1)]
+        parts.append("    [dim]│[/]" + " " * (spaces - 2))
+        return "".join(parts)
+
+    def _tool_result_indent(self) -> str:
+        if self.current_depth <= 0:
+            return "    [dim]└─[/]"
+        parts = ["    [dim]│[/]   " * self.current_depth]
+        parts.append("[dim]│  └─[/]")
+        return "".join(parts)
+
+    def _err_indent(self) -> str:
+        if self.current_depth <= 0:
+            return "      "
+        parts = ["    [dim]│[/]   " * self.current_depth]
+        parts.append("[dim]│     [/]")
+        return "".join(parts)
+
+    def _correction_indent(self) -> str:
+        if self.current_depth <= 0:
+            return "    "
+        parts = ["    [dim]│[/]   " * self.current_depth]
+        parts.append("[dim]│  [/]")
+        return "".join(parts)
+
     def on_run_start(self, user_message: str) -> None:
         self._tools = []
         self._attempt = 0
         self._corrections = 0
-        self.console.print()
+        if self.current_depth <= 0:
+            self.console.print()
 
     def on_thinking_start(self, attempt: int, max_steps: int) -> None:
         self._attempt = attempt
         self._max_steps = max_steps
         spinner = self._next_spinner()
+        indent = self._indent(2)
+        agent_name = "Sub-agent" if self.current_depth > 0 else "Codini"
         self.console.print(
-            f"  {spinner}  [dim italic]Codini thinking …[/]  "
+            f"{indent}{spinner}  [dim italic]{agent_name} thinking …[/]  "
             f"[dim](step {attempt}/{max_steps})[/]"
         )
 
     def on_thinking_end(self, duration_ms: int) -> None:
-        ms = duration_ms
+        indent = self._indent(6)
         self.console.print(
-            f"  {' ' * 2}[dim]└─ model responded in {ms}ms[/]"
+            f"{indent}[dim]└─ model responded in {duration_ms}ms[/]"
         )
 
     def on_tool_call(self, name: str, args: dict, risky: bool) -> None:
@@ -153,8 +188,9 @@ class RichTrace(TraceHooks):
         color = TOOL_COLORS.get(name, "#38bdf8")
         summary = _args_summary(name, args)
         risk_tag = f" [bold red][risky][/]" if risky else ""
+        indent = self._indent(4)
         self.console.print(
-            f"  [dim]├─[/] [{color}]{icon} {name}[/]"
+            f"{indent}[dim]├─[/] [{color}]{icon} {name}[/]"
             f"  [dim]{summary}[/]{risk_tag}"
         )
 
@@ -163,8 +199,9 @@ class RichTrace(TraceHooks):
         status_icon = "✅" if ok else "❌"
         status_color = COLOR_SUCCESS if ok else COLOR_ERROR
         ms = duration_ms
+        indent = self._tool_result_indent()
         self.console.print(
-            f"  [dim]│  └─[/] [{status_color}]{status_icon}[/] "
+            f"{indent} [{status_color}]{status_icon}[/] "
             f"[dim]{summary} • {ms}ms[/]"
         )
         self._tools.append({
@@ -176,37 +213,39 @@ class RichTrace(TraceHooks):
 
         if not ok:
             err_lines = result_text.strip().split("\n")[:3]
+            err_prefix = self._err_indent()
             for line in err_lines:
                 clipped = line[:80]
-                self.console.print(f"  [dim]│     [/][red dim]{clipped}[/]")
+                self.console.print(f"{err_prefix}[red dim]{clipped}[/]")
 
     def on_response_correction(self, attempt: int) -> None:
         self._corrections += 1
+        indent = self._correction_indent()
         self.console.print(
-            f"  [dim]│  [/][yellow]⚠ response format error — retrying[/]"
+            f"{indent}[yellow]⚠ response format error — retrying[/]"
         )
 
     def on_answer(self, final_text: str, promotions: list, rejections: list,
                   tools_summary: list[dict], total_duration_ms: int,
                   prompt_metadata: dict, completion_metadata: dict) -> None:
+        
+        if self.current_depth > 0:
+            prefix = self._indent(4)
+            answer_text = final_text.strip()
+            if answer_text:
+                indented = "\n".join(prefix + line for line in answer_text.splitlines())
+                self.console.print(indented)
+            
+            total_s = total_duration_ms / 1000
+            self.console.print(f"{prefix}[dim]└─[/] Sub-agent finished in {total_s:.1f}s")
+            return
+
         self.console.print()
 
         answer_text = final_text.strip()
         if answer_text:
-            has_code = "```" in answer_text
-            if has_code:
-                self.console.print(
-                    Panel(
-                        answer_text,
-                        title="[bold green] Answer[/]",
-                        title_align="left",
-                        border_style="#10b981",
-                        padding=(0, 1),
-                        expand=False,
-                    )
-                )
-            else:
-                self.console.print( f"  [bold green][/] {answer_text}")
+            indented = "\n".join("  " + line for line in answer_text.splitlines())
+            self.console.print(indented)
 
         if promotions:
             self.console.print()
@@ -249,16 +288,24 @@ class RichTrace(TraceHooks):
         stats_text = "  │  ".join(parts)
         self.console.print()
         self.console.print(
-            Panel(
-                stats_text,
-                border_style=COLOR_DIM,
-                box=box.ROUNDED,
-                padding=(0, 1),
-                expand=False,
+            Padding(
+                Panel(
+                    stats_text,
+                    border_style=COLOR_DIM,
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                    expand=False,
+                ),
+                (0, 0, 0, 2)
             )
         )
 
     def on_run_error(self, error: str) -> None:
+        if self.current_depth > 0:
+            indent = self._indent(4)
+            self.console.print(f"{indent}[bold red]❌ Sub-agent Error:[/] {error}")
+            return
+
         self.console.print()
         self.console.print(
             Panel(
@@ -275,47 +322,85 @@ class RichTrace(TraceHooks):
 
 class PlainTrace(TraceHooks):
     def __init__(self, max_result_chars: int = 600):
+        super().__init__()
         self.max_result_chars = max_result_chars
         self._tools = []
         self._attempt = 0
         self._corrections = 0
+        self.current_depth = 0
+
+    def _indent(self, spaces: int) -> str:
+        if self.current_depth <= 0:
+            return " " * spaces
+        parts = ["  |   " * (self.current_depth - 1)]
+        parts.append("  |" + " " * (spaces - 2))
+        return "".join(parts)
+
+    def _tool_result_indent(self) -> str:
+        if self.current_depth <= 0:
+            return "    |─"
+        parts = ["  |   " * self.current_depth]
+        parts.append("  |─")
+        return "".join(parts)
+
+    def _err_indent(self) -> str:
+        if self.current_depth <= 0:
+            return "        "
+        parts = ["  |   " * self.current_depth]
+        parts.append("     ")
+        return "".join(parts)
 
     def on_run_start(self, user_message: str) -> None:
         self._tools = []
         self._attempt = 0
         self._corrections = 0
-        print()
+        if self.current_depth <= 0:
+            print()
 
     def on_thinking_start(self, attempt: int, max_steps: int) -> None:
         self._attempt = attempt
-        print(f"  ~ Codini thinking ...  (step {attempt}/{max_steps})")
+        indent = self._indent(2)
+        agent_name = "Sub-agent" if self.current_depth > 0 else "Codini"
+        print(f"{indent}~ {agent_name} thinking ...  (step {attempt}/{max_steps})")
 
     def on_thinking_end(self, duration_ms: int) -> None:
-        print(f"    └─ model responded in {duration_ms}ms")
+        indent = self._indent(6)
+        print(f"{indent}└─ model responded in {duration_ms}ms")
 
     def on_tool_call(self, name: str, args: dict, risky: bool) -> None:
         summary = _args_summary(name, args)
         risk_tag = " [risky]" if risky else ""
-        print(f"  |─ {name}  {summary}{risk_tag}")
+        indent = self._indent(4)
+        print(f"{indent}|─ {name}  {summary}{risk_tag}")
 
     def on_tool_result(self, name: str, result_text: str, duration_ms: int, success: bool) -> None:
         summary, ok = _result_summary(name, result_text)
         status = "OK " if ok else "ERR"
-        print(f"    |─ [{status}] {summary} • {duration_ms}ms")
+        indent = self._tool_result_indent()
+        print(f"{indent} [{status}] {summary} • {duration_ms}ms")
         self._tools.append({
             "name": name, "success": ok, "summary": summary, "duration_ms": duration_ms,
         })
         if not ok:
+            err_prefix = self._err_indent()
             for line in result_text.strip().split("\n")[:3]:
-                print(f"        {line[:80]}")
+                print(f"{err_prefix}{line[:80]}")
 
     def on_response_correction(self, attempt: int) -> None:
         self._corrections += 1
-        print(f"    |  ⚠ response format error — retrying")
+        indent = self._indent(4)
+        print(f"{indent}⚠ response format error — retrying")
 
     def on_answer(self, final_text: str, promotions: list, rejections: list,
                   tools_summary: list[dict], total_duration_ms: int,
                   prompt_metadata: dict, completion_metadata: dict) -> None:
+        
+        if self.current_depth > 0:
+            indent = self._indent(6)
+            total_s = total_duration_ms / 1000
+            print(f"{indent}└─ Sub-agent finished in {total_s:.1f}s")
+            return
+
         print()
         answer_text = final_text.strip()
         if answer_text:
@@ -362,6 +447,11 @@ class PlainTrace(TraceHooks):
         print()
 
     def on_run_error(self, error: str) -> None:
+        if self.current_depth > 0:
+            indent = self._indent(4)
+            print(f"{indent}❌ Sub-agent Error: {error}")
+            return
+
         print()
         print(f"  ❌ Run Error: {error}")
         print()
