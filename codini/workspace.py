@@ -1,5 +1,3 @@
-
-
 import subprocess
 import textwrap
 import hashlib
@@ -10,28 +8,35 @@ from pathlib import Path
 MAX_TOOL_OUTPUT = 4000
 MAX_HISTORY = 25000
 
-# 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 IGNORED_PATH_NAMES = {".git", ".codini", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
-def clip(text, limit = MAX_TOOL_OUTPUT):
-    text = str(text)
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
 
-def middle(text, limit):
-    text = str(text).replace("\n", " ")
+def clip(text, limit = MAX_TOOL_OUTPUT):
+    return middle(text, limit, replace_newlines=False)
+
+
+def middle(text, limit, replace_newlines=True):
+    text = str(text)
+    if replace_newlines:
+        text = text.replace("\n", " ")
     if len(text) <= limit:
         return text
-    if limit <= 3:
-        return text[:limit]
-    left = (limit - 3) // 2
-    right = limit - 3 - left
-    return text[:left] + "..." + text[-right:]
+    if limit <= 10:
+        return text[:limit] + "..."
+    
+    left = int(limit * 0.4)
+    right = limit - left
+    
+    if replace_newlines:
+        return text[:left] + "..." + text[-right:]
+    else:
+        truncated_len = len(text) - limit
+        middle_msg = f"\n... [truncated {truncated_len} chars] ...\n"
+        return text[:left] + middle_msg + text[-right:]
 
 
 class WorkspaceContext:

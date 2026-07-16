@@ -13,6 +13,11 @@ from functools import partial
 
 from .workspace import IGNORED_PATH_NAMES, clip
 
+
+def _now_iso():
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
 BASE_TOOL_SPECS = {
     "list_files": {
         "schema": {"path": "str='.'"},
@@ -99,7 +104,7 @@ def validate_tool(agent, name, args):
         if not path.is_dir():
             raise ValueError("path is not a directory")
         return
-    
+
     if name == "read_file":
         path = agent.path(args["path"])
         if not path.is_file():
@@ -116,7 +121,7 @@ def validate_tool(agent, name, args):
             raise ValueError("pattern must not be empty")
         agent.path(args.get("path", "."))
         return
-    
+
     if name == "run_shell":
         command = str(args.get("command", "")).strip()
         if not command:
@@ -125,7 +130,7 @@ def validate_tool(agent, name, args):
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be between 1 and 120 seconds")
         return
-    
+
     if name == "write_file":
         path = agent.path(args["path"])
         if path.exists() and path.is_dir():
@@ -148,16 +153,16 @@ def validate_tool(agent, name, args):
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
         return
-    
+
     if name == "delegate":
         task = str(args.get("task", "")).strip()
         if not task:
             raise ValueError("task must not be empty")
         return
-    
+
     if name == "list_skills":
         return
-    
+
     if name == "read_skill":
         skill_name = str(args.get("name", "")).strip()
         if not skill_name:
@@ -166,13 +171,13 @@ def validate_tool(agent, name, args):
         if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
             raise ValueError("invalid skill name")
         return
-    
+
 
 def tool_list_files(agent, args):
     path = agent.path(args.get("path","."))
     if not path.is_dir():
         raise ValueError("path is not a directory")
-    
+
     entries = [
         item for item in sorted(path.iterdir(), key = lambda item: (item.is_file(), item.name.lower()))
         if item.name not in IGNORED_PATH_NAMES
@@ -183,12 +188,11 @@ def tool_list_files(agent, args):
         lines.append(f"{kind} {entry.relative_to(agent.root)}")
     return "\n".join(lines) or "(empty)"
 
-
 def tool_read_file(agent, args):
     path = agent.path(args["path"])
     if not path.is_file():
         raise ValueError("path is not a file")
-    
+
     start = int(args.get("start", 1))
     end = int(args.get("end", 200))
     if start < 1 or end < start:
@@ -200,7 +204,6 @@ def tool_read_file(agent, args):
     if end < total:
         header += f" [lines {start}-{min(end, total)}]"
     return f"{header}\n{body}"
-
 
 def tool_search(agent, args):
     pattern = str(args.get("pattern","")).strip()
@@ -216,10 +219,10 @@ def tool_search(agent, args):
             capture_output=True,
             text=True,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
-    
+
     matches = []
     files = [path] if path.is_file() else [
         item for item in path.rglob("*")
@@ -232,7 +235,6 @@ def tool_search(agent, args):
                 if len(matches) >= 200:
                     return "\n".join(matches)
     return "\n".join(matches) or "(no matches)"
-
 
 def tool_run_shell(agent, args):
     command = str(args.get("command", "")).strip()
@@ -247,9 +249,9 @@ def tool_run_shell(agent, args):
         shell = True,
         capture_output = True,
         text = True,
-        timeout = timeout,
         encoding = "utf-8",
         errors = "replace",
+        timeout = timeout,
         env = agent.shell_env()
     )
     return textwrap.dedent(
@@ -284,7 +286,7 @@ def tool_patch_file(agent, args):
     count = text.count(old_text)
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
-    
+
     path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
     return f"patched {path.relative_to(agent.root)} ({len(text)} chars)"
 
@@ -300,9 +302,7 @@ def _count_trace_events(agent):
     能高亮那个"调用了子 agent"的 tool_executed 事件。
     """
     try:
-        trace_path = agent.run_store.trace_path(agent.current_task_state)
-        with trace_path.open("r", encoding="utf-8") as handle:
-            return sum(1 for line in handle if line.strip())
+        return len(agent.run_store.load_trace_events(agent.current_task_state.run_id))
     except (OSError, AttributeError, TypeError, ValueError):
         return -1
 
@@ -323,7 +323,7 @@ def tool_delegate(agent, args):
 
     child_session = {
         "id": agent.session.get("id", "") + "-sub-" + uuid.uuid4().hex[:6],
-        "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "created_at": _now_iso(),
         "workspace_root": agent.workspace.repo_root,
         "history": [],
         "memory": agent.memory.to_dict(),
@@ -348,6 +348,7 @@ def tool_delegate(agent, args):
     # 把父 run 信息显式灌进子 agent 属性，等子 ask() 启动时会复制给子 task_state
     child.parent_run_id = parent_run_id
     child.parent_tool_event_index = _count_trace_events(agent)
+    child.parent_span_id = getattr(agent, "current_tool_span_id", "") or ""
     child.agent_rope = parent_agent_rope
 
     # 用 append_note 插入父 context 笔记，防止被 memory normalizer 擦除
@@ -358,6 +359,23 @@ def tool_delegate(agent, args):
     )
     child.session["memory"] = child.memory.to_dict()
     raw = child.ask(task + _DELEGATE_FORMAT_INSTRUCTION)
+    child_task_state = getattr(child, "current_task_state", None)
+    if child_task_state is not None:
+        child_info = {
+            "parent_run_id": parent_run_id,
+            "parent_span_id": getattr(agent, "current_tool_span_id", "") or child.parent_span_id,
+            "parent_tool_event_index": child.parent_tool_event_index,
+            "child_session_id": child.session.get("id", ""),
+            "child_run_id": child_task_state.run_id,
+            "child_trace_id": child_task_state.run_id,
+            "child_task_id": child_task_state.task_id,
+            "child_status": child_task_state.status,
+        }
+        try:
+            agent.run_store.record_child_run(agent.current_task_state, child_info)
+        except Exception:
+            pass
+        agent._last_delegate_child_info = child_info
     return "delegate_result:\n" + _parse_delegate_result(raw)
 
 
@@ -365,7 +383,7 @@ def tool_list_skills(agent, args):
     skills_dir = agent.root / ".codini" / "skills"
     if not skills_dir.exists() or not skills_dir.is_dir():
         return "(no skills available)"
-    
+
     skills = []
     for item in skills_dir.iterdir():
         if item.is_file() and item.name.endswith(".md"):
@@ -373,10 +391,10 @@ def tool_list_skills(agent, args):
         elif item.is_dir():
             if (item / "SKILL.md").is_file() or (item / "README.md").is_file():
                 skills.append(f"{item.name} (package)")
-                
+
     if not skills:
         return "(no skills available)"
-    
+
     return "Available skills:\n" + "\n".join(f"- {s}" for s in sorted(skills))
 
 
@@ -385,26 +403,25 @@ def tool_read_skill(agent, args):
     skill_name = raw_name.replace(" (package)", "")
     if skill_name.endswith(".md"):
         skill_name = skill_name[:-3]
-        
+
     skills_dir = agent.root / ".codini" / "skills"
-    
     dir_path = skills_dir / skill_name
     if dir_path.is_dir():
         md_path = dir_path / "SKILL.md"
         if not md_path.is_file():
             md_path = dir_path / "README.md"
-        
+
         if md_path.is_file():
             content = md_path.read_text(encoding="utf-8", errors="replace")
             files_in_dir = [f.name for f in dir_path.iterdir() if f.is_file()]
             files_str = "\n".join(f"  - {f}" for f in files_in_dir)
             return f"# SKILL Package: {skill_name}\n\nFiles in package:\n{files_str}\n\n## Documentation\n\n{content}"
-            
+
     file_path = skills_dir / f"{skill_name}.md"
     if file_path.is_file():
         content = file_path.read_text(encoding="utf-8", errors="replace")
         return f"# SKILL: {skill_name}\n\n{content}"
-        
+
     raise ValueError(f"SKILL '{raw_name}' not found. Use list_skills to see available skills.")
 
 

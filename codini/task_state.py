@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
+
+def _now_iso():
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_STOPPED = "stopped"
@@ -30,6 +35,7 @@ STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+STOP_REASON_RUNTIME_ERROR = "runtime_error"
 
 
 @dataclass
@@ -43,14 +49,17 @@ class TaskState:
     last_tool: str = ""
     stop_reason: str = ""
     final_answer: str = ""
+    error: dict = field(default_factory=dict)
     checkpoint_id: str = ""
     resume_status: str = ""
 
     session_id: str = ""
     parent_run_id: str = ""
     parent_tool_event_index: int = -1
+    parent_span_id: str = ""
     agent_rope: str = ""
     depth: int = 0
+    # 子 task_state 归子 run 自己的 session_store 管，session_id 给 viewer 用来跳到父 session
     created_at: str = ""
 
     # run 级共享字段，会跟随每个 trace event 下发
@@ -69,13 +78,14 @@ class TaskState:
     def create(cls, task_id, user_request, run_id="", **kwargs):
         if not run_id:
             run_id = "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
-        agent_rope = kwargs.pop("agent_rope", None) or run_id
+        parent_agent_rope = kwargs.pop("agent_rope", None)
+        agent_rope = (parent_agent_rope + "::" + run_id) if parent_agent_rope else run_id
         return cls(
             run_id=run_id,
             task_id=task_id,
             user_request=user_request,
             agent_rope=agent_rope,
-            created_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            created_at=_now_iso(),
             **kwargs,
         )
 
@@ -91,11 +101,13 @@ class TaskState:
             "last_tool": str(data.get("last_tool", "")),
             "stop_reason": str(data.get("stop_reason", "")),
             "final_answer": str(data.get("final_answer", "")),
+            "error": dict(data.get("error") or {}),
             "checkpoint_id": str(data.get("checkpoint_id", "")),
             "resume_status": str(data.get("resume_status", "")),
             "session_id": str(data.get("session_id", "")),
             "parent_run_id": str(data.get("parent_run_id", "")),
             "parent_tool_event_index": int(data.get("parent_tool_event_index", -1)),
+            "parent_span_id": str(data.get("parent_span_id", "")),
             "agent_rope": str(data.get("agent_rope", "")),
             "depth": int(data.get("depth", 0)),
             "created_at": str(data.get("created_at", "")),
@@ -109,7 +121,7 @@ class TaskState:
         return cls(**base)
 
     def record_attempt(self):
-        # attempt 统计的是"模型被调用了几轮"，不等价 tool_steps。
+        # attempt 统计的是"模型被调用了几轮"，不等于 tool_steps。
         self.attempts += 1
         return self
 
@@ -135,6 +147,9 @@ class TaskState:
     def stop_model_error(self, final_answer=""):
         return self.stop(STOP_REASON_MODEL_ERROR, status=STATUS_FAILED, final_answer=final_answer)
 
+    def stop_runtime_error(self, final_answer=""):
+        return self.stop(STOP_REASON_RUNTIME_ERROR, status=STATUS_FAILED, final_answer=final_answer)
+
     def finish_success(self, final_answer):
         self.status = STATUS_COMPLETED
         self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
@@ -154,10 +169,12 @@ class TaskState:
             "last_tool": self.last_tool,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
+            "error": self.error,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
             "parent_run_id": self.parent_run_id,
             "parent_tool_event_index": self.parent_tool_event_index,
+            "parent_span_id": self.parent_span_id,
             "agent_rope": self.agent_rope,
             "depth": self.depth,
             "created_at": self.created_at,
