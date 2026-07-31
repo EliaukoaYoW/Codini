@@ -27,7 +27,7 @@ BASE_TOOL_SPECS = {
     "read_file": {
         "schema": {"path": "str", "start": "int=1", "end": "int=200"},
         "risky": False,
-        "description": "Read a UTF-8 file by line range."
+        "description": "Read a UTF-8 file by line range (default end=200). Output header shows total lines; use start/end to read beyond the first 200."
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
@@ -73,14 +73,17 @@ TOOL_EXAMPLES = {
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-    "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
+    "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":5}}</tool>',
     "list_skills": '<tool>{"name":"list_skills","args":{}}</tool>',
     "read_skill": '<tool>{"name":"read_skill","args":{"name":"copyright_generator"}}</tool>'
 }
 
 
 _DELEGATE_FORMAT_INSTRUCTION = textwrap.dedent("""\
-    After completing the investigation, write your findings directly in the <final> answer as clear, concise natural language. Do not add any labels like STATUS, STEPS_USED, or FINDINGS — just write the factual conclusions you discovered.
+    After completing the investigation, write your complete answer inside the <final> and </final> tags.
+    If your task involves reading, searching, or inspecting files/outputs, you MUST include the exact raw text, code snippets, or command outputs in your final answer so the parent agent has the direct source evidence.
+    Do not write excessive, redundant summaries — focus on delivering the direct factual evidence.
+    Do not add any labels like STATUS, STEPS_USED, or FINDINGS — just write the conclusions and evidence.
     """)
 
 
@@ -237,22 +240,22 @@ def tool_search(agent, args):
     return "\n".join(matches) or "(no matches)"
 
 def tool_run_shell(agent, args):
+    """
+    功能：通过 Agent 选定的沙箱执行命令；
+    输入: Agent 与命令参数；
+    输出: 包含退出码、标准输出和错误输出的文本。
+    """
     command = str(args.get("command", "")).strip()
     if not command:
         raise ValueError("command must not be empty")
     timeout = int(args.get("timeout", 20))
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be between 1 and 120 seconds")
-    result = subprocess.run(
+    result = agent.sandbox.run_shell(
         command,
-        cwd = agent.root,
-        shell = True,
-        capture_output = True,
-        text = True,
-        encoding = "utf-8",
-        errors = "replace",
-        timeout = timeout,
-        env = agent.shell_env()
+        cwd=agent.root,
+        timeout=timeout,
+        env=agent.shell_env(),
     )
     return textwrap.dedent(
         f"""\
@@ -296,8 +299,8 @@ def _parse_delegate_result(raw: str) -> str:
     return raw.strip()
 
 def _count_trace_events(agent):
-    """估算一下父 run 当前 trace 已写了多少条事件。
-
+    """
+    估算父 run 当前 trace 已写了多少条事件。
     这是子 task_state.parent_tool_event_index 的来源——viewer 展开父 trace 时
     能高亮那个"调用了子 agent"的 tool_executed 事件。
     """
