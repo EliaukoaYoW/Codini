@@ -27,6 +27,10 @@ class Sandbox:
         raise NotImplementedError
 
     def run_shell(self, command, cwd, timeout, env):
+        """
+        功能：在具体沙箱中执行命令；
+        输入：命令、工作目录、超时和环境变量；
+        输出：SandboxResult。"""
         raise NotImplementedError
 
 
@@ -38,6 +42,11 @@ class NoSandbox(Sandbox):
         return "none"
 
     def run_shell(self, command, cwd, timeout, env):
+        """
+        功能：直接在宿主机执行命令；
+        输入：命令、工作目录、超时和环境变量；
+        输出：SandboxResult。
+        """
         try:
             result = subprocess.run(
                 command,
@@ -45,6 +54,8 @@ class NoSandbox(Sandbox):
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 env=env,
             )
@@ -91,6 +102,10 @@ class BubblewrapSandbox(Sandbox):
         return "bubblewrap"
 
     def run_shell(self, command, cwd, timeout, env):
+        """
+        功能：通过 bubblewrap 隔离执行命令；
+        输入：命令、工作目录、超时和环境变量；
+        输出：SandboxResult。"""
         cmd = self._build_command(command, cwd, env)
         try:
             result = subprocess.run(
@@ -98,9 +113,9 @@ class BubblewrapSandbox(Sandbox):
                 cwd=cwd,
                 capture_output=True,
                 text=True,
-                timeout=timeout,
                 encoding="utf-8",
                 errors="replace",
+                timeout=timeout,
                 env=env,  # bwrap 内部用 --clearenv + --setenv 控制
             )
         except subprocess.TimeoutExpired:
