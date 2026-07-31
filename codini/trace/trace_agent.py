@@ -1,20 +1,24 @@
 from __future__ import annotations
 
-import shutil
 import re
 from typing import Optional
 
 try:
-    from rich.console import Console
+    from rich.align import Align
+    from rich.console import Console, Group
+    from rich.markdown import Markdown, TableElement
     from rich.panel import Panel
-    from rich.text import Text
     from rich.table import Table
+    from rich.text import Text
     from rich import box
+    from rich.padding import Padding
+    from rich.theme import Theme
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
 
 from .hooks import TraceHooks
+from ..branding import cli_panel_width
 
 TOOL_ICONS = {
     "read_file": "📖",
@@ -45,8 +49,73 @@ COLOR_USER = "#f472b6"
 COLOR_MEM = "#a78bfa"
 COLOR_SLATE = "#94a3b8"
 COLOR_DIM = "#475569"
+VIEWER_ASSISTANT_COLOR = "#198038"
+VIEWER_MARKDOWN_BORDER = "#aaa39d"
+VIEWER_MARKDOWN_TEXT = "#27231f"
+VIEWER_CODE_BACKGROUND = "#fff2e5"
+ANSWER_MARKDOWN_THEME = (
+    Theme(
+        {
+            "markdown.code": (
+                f"{VIEWER_MARKDOWN_TEXT} on {VIEWER_CODE_BACKGROUND}"
+            ),
+            "markdown.table.border": VIEWER_MARKDOWN_BORDER,
+            "markdown.table.header": f"bold {VIEWER_ASSISTANT_COLOR}",
+        }
+    )
+    if HAS_RICH
+    else None
+)
+
+if HAS_RICH:
+    class ViewerTableElement(TableElement):
+        """功能：按 Viewer 色板渲染完整边框表格；输入：Markdown 表格节点；输出：Rich 表格。"""
+
+        def __rich_console__(self, console, options):
+            """功能：生成带完整框线的终端表格；输入：Rich 控制台与渲染选项；输出：表格渲染流。"""
+            table = Table(
+                box=box.ROUNDED,
+                pad_edge=True,
+                border_style="markdown.table.border",
+                show_edge=True,
+                show_lines=True,
+                collapse_padding=True,
+            )
+
+            if self.header is not None and self.header.row is not None:
+                for column in self.header.row.cells:
+                    heading = column.content.copy()
+                    heading.stylize("markdown.table.header")
+                    table.add_column(heading)
+
+            if self.body is not None:
+                for row in self.body.rows:
+                    table.add_row(*(element.content for element in row.cells))
+
+            yield table
+
+
+    class ViewerMarkdown(Markdown):
+        """功能：使用 Codini 统一样式渲染 Markdown；输入：Markdown 文本；输出：Rich 可渲染对象。"""
+
+        elements = {
+            **Markdown.elements,
+            "table_open": ViewerTableElement,
+        }
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _remaining_context_percent(prompt_metadata: dict) -> float | None:
+    """功能：计算本轮 Prompt Context 剩余比例；输入：上下文元数据；输出：0–100 的百分比或 None。"""
+    try:
+        used = float(prompt_metadata.get("prompt_chars", 0))
+        budget = float(prompt_metadata.get("prompt_budget_chars", 0))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if budget <= 0:
+        return None
+    return max(0.0, min(100.0, (budget - used) / budget * 100))
 
 
 def _args_summary(name: str, args: dict) -> str:
@@ -187,7 +256,7 @@ class RichTrace(TraceHooks):
         icon = TOOL_ICONS.get(name, "🔧")
         color = TOOL_COLORS.get(name, "#38bdf8")
         summary = _args_summary(name, args)
-        risk_tag = f" [bold red][risky][/]" if risky else ""
+        risk_tag = " [bold red][risky][/]" if risky else ""
         indent = self._indent(4)
         self.console.print(
             f"{indent}[dim]├─[/] [{color}]{icon} {name}[/]"
@@ -228,6 +297,7 @@ class RichTrace(TraceHooks):
     def on_answer(self, final_text: str, promotions: list, rejections: list,
                   tools_summary: list[dict], total_duration_ms: int,
                   prompt_metadata: dict, completion_metadata: dict) -> None:
+        """功能：用统一面板渲染最终回答与运行摘要；输入：回答、记忆和运行指标；输出：无。"""
         
         if self.current_depth > 0:
             prefix = self._indent(4)
@@ -242,34 +312,12 @@ class RichTrace(TraceHooks):
 
         self.console.print()
 
-        answer_text = final_text.strip()
-        if answer_text:
-            indented = "\n".join("  " + line for line in answer_text.splitlines())
-            self.console.print(indented)
-
-        if promotions:
-            self.console.print()
-            self.console.print(f"  [dim]💾 Durable memory promoted:[/]")
-            for topic, note_text in promotions:
-                self.console.print(
-                    f"  [dim]   •[/] [italic]{topic}[/]: "
-                    f"[dim]{note_text}[/]"
-                )
-
         total_s = total_duration_ms / 1000
         total_tools = len(tools_summary)
         ok_tools = sum(1 for t in tools_summary if t["success"])
         total_tool_ms = sum(t["duration_ms"] for t in tools_summary)
 
         tokens = completion_metadata.get("usage", {})
-        prompt_tokens = (
-            completion_metadata.get("prompt_tokens")
-            or tokens.get("prompt_tokens", 0)
-        )
-        completion_tokens = (
-            completion_metadata.get("completion_tokens")
-            or tokens.get("completion_tokens", 0)
-        )
         total_tokens = (
             completion_metadata.get("total_tokens")
             or tokens.get("total_tokens", 0)
@@ -278,27 +326,61 @@ class RichTrace(TraceHooks):
         parts = [
             f"[dim]⏱[/] [bold]{total_s:.1f}[/]s",
             f"[dim]🔧[/] {ok_tools}/{total_tools} tools",
-            f"[dim]⚡[/] {total_tool_ms}ms tool time",
+            f"[dim]⚡[/] {total_tool_ms}ms",
         ]
         if total_tokens:
-            parts.append(f"[dim]🧠[/] {total_tokens} tokens")
+            parts.append(f"[dim]🧠[/] {total_tokens} tok")
+        context_left = _remaining_context_percent(prompt_metadata)
+        if context_left is not None:
+            parts.append(
+                f"[dim]◔[/] [bold]{context_left:.0f}%[/] context left"
+            )
         if self._corrections:
             parts.append(f"[dim]⚠[/] {self._corrections} corrections")
 
         stats_text = "  │  ".join(parts)
-        self.console.print()
-        self.console.print(
+        answer_renderables = []
+        answer_text = final_text.strip()
+        if answer_text:
+            answer_renderables.append(ViewerMarkdown(answer_text))
+        if promotions:
+            promotion_text = Text()
+            if answer_renderables:
+                promotion_text.append("\n")
+            promotion_text.append("💾 Durable memory promoted:\n", style="dim")
+            for index, (topic, note_text) in enumerate(promotions):
+                promotion_text.append("   • ", style="dim")
+                promotion_text.append(f"{topic}: ", style="italic")
+                promotion_text.append(str(note_text), style="dim")
+                if index < len(promotions) - 1:
+                    promotion_text.append("\n")
+            answer_renderables.append(promotion_text)
+
+        # 单列表格让回答下边线与统计上边线合并为一条贯通的分隔线。
+        conversation = Table(
+            show_header=False,
+            show_lines=True,
+            box=box.ROUNDED,
+            border_style="grey37",
+            padding=(0, 0),
+            width=cli_panel_width(self.console.width),
+            expand=True,
+        )
+        conversation.add_column(overflow="fold")
+        if answer_renderables:
+            conversation.add_row(
+                Padding(Group(*answer_renderables), (0, 3, 0, 2))
+            )
+        conversation.add_row(
             Padding(
-                Panel(
-                    stats_text,
-                    border_style=COLOR_DIM,
-                    box=box.ROUNDED,
-                    padding=(0, 1),
-                    expand=False,
-                ),
-                (0, 0, 0, 2)
+                Align.center(Text.from_markup(stats_text)),
+                (0, 1),
             )
         )
+
+        # 仅覆盖回答区域的行内代码样式，避免 Rich 默认的黑色背景污染浅色终端。
+        with self.console.use_theme(ANSWER_MARKDOWN_THEME, inherit=True):
+            self.console.print(conversation)
 
     def on_run_error(self, error: str) -> None:
         if self.current_depth > 0:
@@ -404,12 +486,12 @@ class PlainTrace(TraceHooks):
         print()
         answer_text = final_text.strip()
         if answer_text:
-            print(f"  ✨ Answer:")
+            print("  ✨ Answer:")
             for line in answer_text.split("\n"):
                 print(f"    {line}")
 
         if promotions:
-            print(f"\n  Durable memory promoted:")
+            print("\n  Durable memory promoted:")
             for topic, note_text in promotions:
                 print(f"    • {topic}: {note_text}")
 
@@ -419,14 +501,6 @@ class PlainTrace(TraceHooks):
         total_tool_ms = sum(t["duration_ms"] for t in tools_summary)
 
         tokens = completion_metadata.get("usage", {})
-        prompt_tokens = (
-            completion_metadata.get("prompt_tokens")
-            or tokens.get("prompt_tokens", 0)
-        )
-        completion_tokens = (
-            completion_metadata.get("completion_tokens")
-            or tokens.get("completion_tokens", 0)
-        )
         total_tokens = (
             completion_metadata.get("total_tokens")
             or tokens.get("total_tokens", 0)
@@ -439,6 +513,9 @@ class PlainTrace(TraceHooks):
         ]
         if total_tokens:
             parts.append(f"🧠 {total_tokens} tok")
+        context_left = _remaining_context_percent(prompt_metadata)
+        if context_left is not None:
+            parts.append(f"◔ {context_left:.0f}% context left")
         if self._corrections:
             parts.append(f"⚠ {self._corrections} corrections")
 

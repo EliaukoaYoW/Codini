@@ -1,7 +1,6 @@
 import contextvars
 import time
 import uuid
-import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -163,6 +162,16 @@ class FileSpanExporter(SpanProcessor):
         inherited["read_only"] = bool(getattr(task_state, "read_only", False))
         inherited["sandbox"] = str(getattr(task_state, "sandbox", "none") or "none")
         inherited["session_id"] = getattr(task_state, "session_id", "") or inherited.get("session_id", "")
+        inherited["initial_step_limit"] = int(getattr(task_state, "initial_step_limit", 0) or 0)
+        inherited["soft_step_limit"] = int(getattr(task_state, "soft_step_limit", 0) or 0)
+        inherited["hard_step_limit"] = int(getattr(task_state, "hard_step_limit", 0) or 0)
+        inherited["budget_extensions"] = int(getattr(task_state, "budget_extensions", 0) or 0)
+        inherited["recent_progress_score"] = int(getattr(task_state, "recent_progress_score", 0) or 0)
+        inherited["no_progress_count"] = int(getattr(task_state, "no_progress_count", 0) or 0)
+        inherited["progress_reasons"] = list(getattr(task_state, "progress_reasons", []) or [])
+        inherited["semantic_repeat_count"] = int(getattr(task_state, "semantic_repeat_count", 0) or 0)
+        inherited["last_semantic_reason"] = str(getattr(task_state, "last_semantic_reason", "") or "")
+        inherited["last_semantic_signature"] = str(getattr(task_state, "last_semantic_signature", "") or "")
         return inherited
 
     def _write_event(self, event_name, span, extra=None):
@@ -277,7 +286,17 @@ class FileSpanExporter(SpanProcessor):
                 "child_session_id": span.attributes.get("child_session_id"),
                 "child_run_id": span.attributes.get("child_run_id"),
                 "child_trace_id": span.attributes.get("child_trace_id"),
-                "diffs": span.attributes.get("diffs", []),
+                "diffs": span.attributes.get("diffs", []),                
+                "progress_score": span.attributes.get("progress_score", 0),
+                "progress_reasons": span.attributes.get("progress_reasons", []),
+                "no_progress_count": span.attributes.get("no_progress_count", 0),
+                "semantic_repeat": bool(span.attributes.get("semantic_repeat", False)),
+                "semantic_repeat_blocked": bool(span.attributes.get("semantic_repeat_blocked", False)),
+                "semantic_reason": span.attributes.get("semantic_reason", ""),
+                "semantic_signature": span.attributes.get("semantic_signature", ""),
+                "semantic_intent": span.attributes.get("semantic_intent", ""),
+                "semantic_repeat_count": span.attributes.get("semantic_repeat_count", 0),
+                "semantic_cycle_length": span.attributes.get("semantic_cycle_length", 0),
             })
 
     def on_span_event(self, span, name, attributes):
