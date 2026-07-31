@@ -5,10 +5,10 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from .evalutor import run_fixed_benchmark
-from .models import FakeModelClient, OpenAICompatibleModelClient, SiliconflowModelClient
-from .runtime import Codini, SessionStore
-from .workspace import WorkspaceContext
+from codini.evaluator import run_fixed_benchmark
+from codini.models import FakeModelClient, OpenAICompatibleModelClient, SiliconflowModelClient
+from codini.runtime import Codini, SessionStore
+from codini.workspace import WorkspaceContext
 
 METRICS_SCHEMA_VERSION = 2
 DEFAULT_HARNESS_REGRESSION_V2_PATH = Path("artifacts/harness-regression-v2.json")
@@ -16,7 +16,6 @@ DEFAULT_CONTEXT_ABLATION_V2_PATH = Path("artifacts/context-ablation-v2.json")
 DEFAULT_MEMORY_ABLATION_V2_PATH = Path("artifacts/memory-ablation-v2.json")
 DEFAULT_RECOVERY_ABLATION_V2_PATH = Path("artifacts/recovery-ablation-v2.json")
 DEFAULT_CORE_REPORT_PATH = Path("artifacts/codini-benchmark-core-report.md")
-
 
 
 def _safe_mean(values):
@@ -176,7 +175,7 @@ def aggregate_run_artifacts(runs_root):
             stop_reasons[stop_reason] = stop_reasons.get(stop_reason, 0) + 1
 
     return {
-        "run_count": len(reports) if reports else len(run_dirs),
+        "run_count": len(reports),
         "avg_tool_steps": _safe_mean(tool_steps),
         "avg_attempts": _safe_mean(attempts),
         "avg_prompt_chars": _safe_mean(prompt_chars),
@@ -754,34 +753,67 @@ def _provider_summary_from_artifact(payload):
     }
 
 def _provider_profile(provider):
-    if provider == "gpt":
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            return {"provider": provider, "status": "blocked", "reason": "OPENAI_API_KEY missing"}
+    """功能：读取评估 Provider 配置；输入：Provider 名称；输出：ready 或 blocked 的配置字典。"""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        load_dotenv = None
+    if load_dotenv is not None:
+        load_dotenv()
+    provider = str(provider).strip().lower()
+    if provider == "openai":
+        env_names = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
+        values = {name: os.environ.get(name, "").strip() for name in env_names}
+        missing = [name for name, value in values.items() if not value]
+        if missing:
+            return {
+                "provider": provider,
+                "status": "blocked",
+                "reason": f"missing required environment variables: {', '.join(missing)}",
+            }
         return {
             "provider": provider,
             "status": "ready",
-            "model": os.environ.get("OPENAI_MODEL", "gpt-5.4"),
-            "base_url": os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
-            "api_key": api_key,
+            "model": values["OPENAI_MODEL"],
+            "base_url": values["OPENAI_BASE_URL"],
+            "api_key": values["OPENAI_API_KEY"],
         }
-    api_key = os.environ.get("SILICONFLOW_API_KEY", "")
-    if not api_key:
-        return {"provider": "deepseek", "status": "blocked", "reason": "SILICONFLOW_API_KEY missing"}
+    if provider == "siliconflow":
+        env_names = (
+            "SILICONFLOW_API_KEY",
+            "SILICONFLOW_BASE_URL",
+            "SILICONFLOW_MODEL",
+        )
+        values = {name: os.environ.get(name, "").strip() for name in env_names}
+        missing = [name for name, value in values.items() if not value]
+        if missing:
+            return {
+                "provider": provider,
+                "status": "blocked",
+                "reason": f"missing required environment variables: {', '.join(missing)}",
+            }
+        return {
+            "provider": provider,
+            "status": "ready",
+            "model": values["SILICONFLOW_MODEL"],
+            "base_url": values["SILICONFLOW_BASE_URL"],
+            "api_key": values["SILICONFLOW_API_KEY"],
+        }
     return {
-        "provider": "siliconflow",
-        "status": "ready",
-        "model": os.environ.get("SILICONFLOW_MODEL", "deepseek-ai/DeepSeek-V3.2"),
-        "base_url": os.environ.get("SILICONFLOW_API_BASE", "https://api.siliconflow.cn/v1"),
-        "api_key": api_key,
+        "provider": provider,
+        "status": "blocked",
+        "reason": f"unsupported provider: {provider}",
     }
 
-def _make_provider_client(provider):
+def _make_provider_client(provider, timeout=None):
     profile = _provider_profile(provider)
     if profile["status"] != "ready":
         raise RuntimeError(profile["reason"])
-    timeout = 60
-    if provider == "gpt":
+    timeout = max(
+        30,
+        int(timeout or os.environ.get("CODINI_EXPERIMENT_TIMEOUT", "180")),
+    )
+    if profile["provider"] == "openai":
         return OpenAICompatibleModelClient(
             model=profile["model"],
             base_url=profile["base_url"],
@@ -809,12 +841,12 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
     workspace_root = Path(workspace_root)
     artifact_root = Path(artifact_root)
     providers = []
-    for provider_name in ("gpt", "siliconflow"):
+    for provider_name in ("openai", "siliconflow"):
         profile = _provider_profile(provider_name)
         if profile["status"] != "ready":
             providers.append(profile)
             continue
-        if provider_name == "gpt":
+        if provider_name == "openai":
             def factory(task, workspace, profile=profile):
                 del task, workspace
                 return OpenAICompatibleModelClient(
@@ -903,7 +935,7 @@ def _build_real_agent(workspace_root, provider, approval_policy="auto", read_onl
     )
 
 # 对照实验一: 记忆管理
-def run_real_memory_experiment(provider="gpt", repetitions=1):
+def run_real_memory_experiment(provider="openai", repetitions=1):
     repetitions = int(repetitions)
     provider = str(provider)
     variants = {"memory_on": [], "memory_off": [], "memory_irrelevant": []}
@@ -969,15 +1001,20 @@ def run_real_memory_experiment(provider="gpt", repetitions=1):
         "rows": variants,
     }
 
+
 # 对照实验二: 上下文管理
-def run_real_context_experiment(provider="gpt", repetitions=1):
+def run_real_context_experiment(provider="openai", repetitions=1):
     repetitions = int(repetitions)
     provider = str(provider)
     history_levels = [("short", 4), ("medium", 12), ("long", 24)]
     note_levels = [("low", 2), ("high", 10)]
     request_levels = [
         ("short", "Reply with the target token only."),
-        ("long", "Reply with the target token only. Do not restate the prompt, and do not output any extra words."),
+        (
+            "long",
+            "Reply with the target token only. Do not restate the prompt, "
+            "and do not output any extra words.",
+        ),
     ]
     configs = []
     for history_label, history_count in history_levels:
@@ -986,51 +1023,104 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
                 token = f"TOKEN-{history_label}-{note_label}-{request_label}"
                 per_run = []
                 for _ in range(repetitions):
-                    for variant_name, updates in (("full", {}), ("no_context_reduction", {"context_reduction": False})):
-                        with tempfile.TemporaryDirectory(prefix="codini-real-context-") as temp_dir:
+                    for variant_name, updates in (
+                        ("full", {}),
+                        ("no_context_reduction", {"context_reduction": False}),
+                    ):
+                        with tempfile.TemporaryDirectory(
+                            prefix="codini-real-context-"
+                        ) as temp_dir:
                             workspace_root = Path(temp_dir)
-                            (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
+                            (workspace_root / "README.md").write_text(
+                                "demo\n", encoding="utf-8"
+                            )
                             agent = _build_real_agent(workspace_root, provider)
                             for index in range(note_count):
-                                # 埋入关键信息 以此判断在压缩过程中信息是否被保留/删除 注意只有第一条笔记包含真正的关键信息 其余全是干扰信息
-                                note_text = f"target token is {token}" if index == 0 else f"decoy token is DECOY-{index}"
-                                agent.memory.append_note(note_text, tags=("token",), created_at=f"2026-04-09T10:{index:02d}:00+00:00")
+                                note_text = (
+                                    f"target token is {token}"
+                                    if index == 0
+                                    else f"decoy token is DECOY-{index}"
+                                )
+                                agent.memory.append_note(
+                                    note_text,
+                                    tags=("token",),
+                                    created_at=f"2026-04-09T10:{index:02d}:00+00:00",
+                                )
                             for index in range(history_count):
-                                # 人为膨胀对话历史 制造 Token 压力
                                 agent.record(
                                     {
-                                        "role": "user" if index % 2 == 0 else "assistant",
-                                        "content": f"context-history-{index}-" + ("B" * 220),
-                                        "created_at": f"2026-04-09T11:{index:02d}:00+00:00",
+                                        "role": (
+                                            "user"
+                                            if index % 2 == 0
+                                            else "assistant"
+                                        ),
+                                        "content": (
+                                            f"context-history-{index}-"
+                                            + ("B" * 220)
+                                        ),
+                                        "created_at": (
+                                            f"2026-04-09T11:{index:02d}:00+00:00"
+                                        ),
                                     }
                                 )
                             with _temporary_feature_flags(agent, updates):
-                                answer = agent.ask(f"What is the target token remembered in the notes? {request_text}")
+                                answer = agent.ask(
+                                    "What is the target token remembered in "
+                                    f"the notes? {request_text}"
+                                )
                             per_run.append(
                                 {
                                     "variant": variant_name,
-                                    "prompt_chars": int(agent.last_prompt_metadata.get("prompt_chars", 0)),
-                                    "correct": token.lower() in _normalize_text(answer),
+                                    "prompt_chars": int(
+                                        agent.last_prompt_metadata.get(
+                                            "prompt_chars", 0
+                                        )
+                                    ),
+                                    "correct": (
+                                        token.lower() in _normalize_text(answer)
+                                    ),
                                 }
                             )
-                full_rows = [row for row in per_run if row["variant"] == "full"]
-                raw_rows = [row for row in per_run if row["variant"] == "no_context_reduction"]
-                avg_full = _safe_mean(row["prompt_chars"] for row in full_rows)
-                avg_raw = _safe_mean(row["prompt_chars"] for row in raw_rows)
+                full_rows = [
+                    row for row in per_run if row["variant"] == "full"
+                ]
+                raw_rows = [
+                    row
+                    for row in per_run
+                    if row["variant"] == "no_context_reduction"
+                ]
+                avg_full = _safe_mean(
+                    row["prompt_chars"] for row in full_rows
+                )
+                avg_raw = _safe_mean(
+                    row["prompt_chars"] for row in raw_rows
+                )
                 configs.append(
                     {
-                        "id": f"{history_label}-{note_label}-{request_label}",
+                        "id": (
+                            f"{history_label}-{note_label}-{request_label}"
+                        ),
                         "history_level": history_label,
                         "note_level": note_label,
                         "request_level": request_label,
                         "avg_full_prompt_chars": avg_full,
                         "avg_raw_prompt_chars": avg_raw,
-                        "avg_prompt_compression_ratio": _safe_ratio(avg_raw - avg_full, avg_raw),
-                        "full_correct_rate": _safe_ratio(sum(1 for row in full_rows if row["correct"]), len(full_rows)),
-                        "raw_correct_rate": _safe_ratio(sum(1 for row in raw_rows if row["correct"]), len(raw_rows)),
+                        "avg_prompt_compression_ratio": _safe_ratio(
+                            avg_raw - avg_full, avg_raw
+                        ),
+                        "full_correct_rate": _safe_ratio(
+                            sum(1 for row in full_rows if row["correct"]),
+                            len(full_rows),
+                        ),
+                        "raw_correct_rate": _safe_ratio(
+                            sum(1 for row in raw_rows if row["correct"]),
+                            len(raw_rows),
+                        ),
                     }
                 )
-    ratios = [config["avg_prompt_compression_ratio"] for config in configs]
+    ratios = [
+        config["avg_prompt_compression_ratio"] for config in configs
+    ]
     full_chars = [config["avg_full_prompt_chars"] for config in configs]
     raw_chars = [config["avg_raw_prompt_chars"] for config in configs]
     return {
@@ -1095,7 +1185,7 @@ def _run_real_repeated_call_scenario(provider):
         return _security_result_row("repeated_identical_call", provider, dict(agent._last_tool_result_metadata))
 
 # 对照实验三: 安全管理
-def run_real_security_experiment_suite(provider="gpt", repetitions=1):
+def run_real_security_experiment_suite(provider="openai", repetitions=1):
     repetitions = int(repetitions)
     provider = str(provider)
     rows = []
@@ -1143,7 +1233,7 @@ def collect_resume_metrics(
     context_repetitions=5,
     security_repetitions=3,
     experiment_mode="synthetic",
-    real_provider="gpt",
+    real_provider="openai",
 ):
     """ 收集实验结果指标 """
     benchmark = aggregate_benckmark_artfifact(benchmark_artifact_path)
@@ -1156,8 +1246,16 @@ def collect_resume_metrics(
         context = run_real_context_experiment(real_provider, context_repetitions)
         security = run_real_security_experiment_suite(real_provider, security_repetitions)
         stress = {
-            "full": {"prompt_chars": int(round(context["summary"].get("avg_full_prompt_chars", 0.0)))},
-            "no_context_reduction": {"prompt_chars": int(round(context["summary"].get("avg_raw_prompt_chars", 0.0)))}
+            "full": {
+                "prompt_chars": int(
+                    round(context["summary"].get("avg_full_prompt_chars", 0.0))
+                )
+            },
+            "no_context_reduction": {
+                "prompt_chars": int(
+                    round(context["summary"].get("avg_raw_prompt_chars", 0.0))
+                )
+            },
         }
     else:
         stress = build_stress_agent_metrics()
@@ -1604,6 +1702,7 @@ def _run_recovery_task_variant(task, variant):
             "false_accept": invalid_resume and resume_status == "full-valid",
             "final_answer": final_answer,
         }
+
 
 def _recovery_variant_summary(rows):
     rows = list(rows)

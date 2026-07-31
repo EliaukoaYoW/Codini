@@ -14,7 +14,6 @@ IGNORED_PATH_NAMES = {".git", ".codini", "__pycache__", ".pytest_cache", ".ruff_
 def now():
     return datetime.now(timezone.utc).isoformat()
 
-
 def clip(text, limit = MAX_TOOL_OUTPUT):
     return middle(text, limit, replace_newlines=False)
 
@@ -61,6 +60,8 @@ class WorkspaceContext:
                     cwd = cwd,
                     capture_output = True,
                     text = True,
+                    encoding = "utf-8",
+                    errors = "replace",
                     check = True,
                     timeout = 5
                 )
@@ -94,7 +95,7 @@ class WorkspaceContext:
                 lambda branch: branch[len("origin/") :] if branch.startswith("origin/") else branch
             )(git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], "origin/main") or "origin/main"),  # 获取远端 origin 对应的默认分支（例如 origin/main 或 origin/master）
             status = clip(git(["status", "--short"], "clean") or "clean", 1500),  # 当前 Git 状态
-            recent_commits = [line for line in git(["log", "--online", "5"]).splitlines() if line],  # 最近 5 个提交记录
+            recent_commits = [line for line in git(["log", "--oneline", "-5"]).splitlines() if line],  # 最近 5 个提交记录
             project_docs = docs
         )
     

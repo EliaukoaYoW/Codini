@@ -22,6 +22,7 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .execution_budget import DynamicStepBudget
 from .run_store import RunStore
 from .task_state import TaskState
 from .sandbox import NoSandbox
@@ -204,6 +205,7 @@ class Codini:
         self.session_path = self.session_store.save(self.session)
         self.parent_run_id = ""
         self.parent_tool_event_index = -1
+        self.parent_span_id = ""
         self.agent_rope = ""
         self.current_task_state = None
         self.current_run_dir = None
@@ -213,6 +215,7 @@ class Codini:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self._unresolved_tool_failures = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -447,14 +450,14 @@ class Codini:
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
         tool_text = "\n".join(tool_lines)
-        examples = "\n".join(
+        tool_names = ", ".join(self.tools)
+        tool_examples = "\n".join(
             [
                 '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
                 '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
                 '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
                 '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
                 '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                "<final>Done.</final>",
             ]
         )
         # 提示词
@@ -467,6 +470,9 @@ class Codini:
 
             Rules:
             - Use your toolbelt to inspect the workspace instead of guessing. Just like Houdini relied on precise tools to resolve any lock, you must examine the facts to guide your decisions.
+            - The registered action tools are exactly: {tool_names}.
+            - <tool> and <final> are output-protocol envelopes, not tool names or agent capabilities.
+            - When the user asks which tools are available, list only the registered action tools. Never present <final> as a tool, action, or capability.
             - Return exactly one <tool>...</tool> or one <final>...</final>.
             - Tool calls must look like:
               <tool>{{"name":"tool_name","args":{{...}}}}</tool>
@@ -492,18 +498,23 @@ class Codini:
             Sandbox: shell commands run inside a {sandbox_name} sandbox.
             {sandbox_notes}
 
-            Tools:
+            Registered action tools (exhaustive):
             {tool_text}
 
-            Valid response examples:
-            {examples}
+            Tool-call examples:
+            {tool_examples}
+
+            Output protocol (not tools):
+            - Use <tool>...</tool> only to request one registered action tool.
+            - Use <final>...</final> only to deliver the user-facing answer and finish the turn.
 
             {workspace_text}
             """
         ).format(
             model_name=model_name,
+            tool_names=tool_names,
             tool_text=tool_text,
-            examples=examples,
+            tool_examples=tool_examples,
             workspace_text=self.workspace.text(),
             sandbox_name=self.sandbox.name,
             sandbox_notes=self._sandbox_notes(),
@@ -825,7 +836,6 @@ class Codini:
         return prompt, metadata
 
     def _complete_with_heartbeat(self, prompt, prompt_cache_key, prompt_cache_retention):
-        model_started_at = time.monotonic()
         try:
             raw = self.model_client.complete(
                 prompt,
@@ -838,7 +848,6 @@ class Codini:
             if "read operation timed out" in err_msg or "timeout" in err_msg.lower():
                 err_msg = f"LLM API request timed out (network read operation timed out). The model provider is likely overloaded: {e}"
             raise RuntimeError(err_msg) from e
-        model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
         return raw
 
     def _accum_model(self, completion_metadata, duration_ms=0):
@@ -902,6 +911,18 @@ class Codini:
             "tools": sorted(tools.items(), key=lambda kv: kv[1], reverse=True),
             "attempts": int(task_state.attempts or 0),
             "tool_steps": int(task_state.tool_steps or 0),
+            "step_budget": {
+                "initial_limit": int(task_state.initial_step_limit or 0),
+                "soft_limit": int(task_state.soft_step_limit or 0),
+                "hard_limit": int(task_state.hard_step_limit or 0),
+                "extensions": int(task_state.budget_extensions or 0),
+                "recent_progress_score": int(task_state.recent_progress_score or 0),
+                "no_progress_count": int(task_state.no_progress_count or 0),
+                "progress_reasons": list(task_state.progress_reasons),
+                "semantic_repeat_count": int(task_state.semantic_repeat_count or 0),
+                "last_semantic_reason": task_state.last_semantic_reason,
+                "last_semantic_signature": task_state.last_semantic_signature,
+            },
             "status": task_state.status,
             "stop_reason": task_state.stop_reason,
         }
@@ -1065,6 +1086,8 @@ class Codini:
             return "No next step recorded."
         if task_state.stop_reason == "step_limit_reached":
             return "Resume from the latest checkpoint and continue the task."
+        if task_state.stop_reason == "no_progress_detected":
+            return "Resume with a different strategy; the previous actions stopped producing new information."
         if task_state.last_tool:
             return f"Decide the next action after {task_state.last_tool}."
         return "Continue the task from the latest checkpoint."
@@ -1087,7 +1110,17 @@ class Codini:
         if name == "read_file":
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
+            if summary != "(empty)":
+                self.memory.append_note(
+                    summary,
+                    tags=(canonical_path, "read_file"),
+                    source=canonical_path,
+                    note_type="observation",
+                    scope="file",
+                    scope_refs=(canonical_path,),
+                    evidence=(f"tool:{name}", canonical_path),
+                    freshness_paths=(canonical_path,),
+                )
         elif name in {"write_file", "patch_file"}:
             self.memory.invalidate_file_summary(canonical_path)
 
@@ -1095,12 +1128,46 @@ class Codini:
         self.update_memory_after_tool(name, args,result)
 
 
-    def record_process_note_for_tool(self, name, metadata):
-        status = str(metadata.get("tool_results","")).strip()
+    def record_process_note_for_tool(self, name, metadata, args=None):
+        if not self.feature_enabled("memory"):
+            return
+        args = dict(args or {})
+        status = str(metadata.get("tool_status", "")).strip()
+        affected_paths = [
+            self.memory.canonical_path(path)
+            for path in metadata.get("affected_paths", [])
+            if str(path).strip()
+        ]
+        if args.get("path"):
+            argument_path = self.memory.canonical_path(args["path"])
+            if argument_path not in affected_paths:
+                affected_paths.append(argument_path)
+        path_text = ", ".join(affected_paths) or "workspace"
+        failure_key = f"{name}:{affected_paths[0] if affected_paths else 'workspace'}"
+
+        if status == "ok":
+            previous = self._unresolved_tool_failures.pop(failure_key, None)
+            if previous:
+                text = f"{name} succeeded on {path_text} after {previous['status']}"
+                self.memory.append_note(
+                    text,
+                    tags=("process", "resolved", name, *affected_paths),
+                    source=name,
+                    kind="process",
+                    note_type="error_resolution",
+                    scope="file" if affected_paths else "project",
+                    scope_refs=tuple(affected_paths),
+                    evidence=(
+                        f"tool:{name}",
+                        f"resolved:{previous.get('error_code') or previous['status']}",
+                        *affected_paths,
+                    ),
+                    freshness_paths=tuple(affected_paths),
+                )
+                self.session["memory"] = self.memory.to_dict()
+            return
         if status not in {"partial_success", "error", "rejected"}:
             return
-        affected_paths = [str(path).strip() for path in metadata.get("affected_paths", []) if str(path).strip()]
-        path_text = ", ".join(affected_paths) or "workspace"
         if status == "partial_success":
             text = f"{name} partial_success on {path_text}; inspect diff before retry"
         elif status == "error":
@@ -1108,7 +1175,21 @@ class Codini:
         else:
             text = f"{name} rejected; choose a different action before retry"
         tags = ["process", status, *affected_paths]
-        self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
+        self.memory.append_note(
+            text,
+            tags=tuple(tags),
+            source=name,
+            kind="process",
+            note_type="observation",
+            scope="file" if affected_paths else "project",
+            scope_refs=tuple(affected_paths),
+            evidence=(f"tool:{name}", *affected_paths),
+            freshness_paths=tuple(affected_paths),
+        )
+        self._unresolved_tool_failures[failure_key] = {
+            "status": status,
+            "error_code": str(metadata.get("tool_error_code", "")),
+        }
         self.session["memory"] = self.memory.to_dict()
 
     def reject_durable_reason(self, note_text):
@@ -1165,12 +1246,54 @@ class Codini:
 
     def promote_durable_memory(self, user_message, final_answer):
         promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
-        promoted, superseded = self.memory.promote_durable(promotions)
+        accepted_promotions = []
+        for topic, note_text in promotions:
+            note_type = memorylib.DURABLE_TOPIC_NOTE_TYPES.get(topic)
+            if not note_type:
+                rejections.append(f"{topic}:unsupported_topic")
+                continue
+            accepted_promotions.append((topic, note_text))
+            self.memory.append_note(
+                note_text,
+                tags=(topic, note_type),
+                source="user_request",
+                note_type=note_type,
+                scope="project",
+                evidence=("user:explicit_memory_request", f"durable_topic:{topic}"),
+            )
+        promoted, superseded = self.memory.promote_durable(accepted_promotions)
         self.session["memory"] = self.memory.to_dict()
         self.last_durable_promotions = promoted
         self.last_durable_rejections = rejections
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
+
+    def capture_user_typed_note(self, user_message):
+        if not self.feature_enabled("memory"):
+            return None
+        text = str(user_message or "").strip()
+        if not text:
+            return None
+        note_type = ""
+        if re.search(r"(?i)(我偏好|我喜欢|我希望|长期偏好|\bprefer\b|\bpreference\b)", text):
+            note_type = "preference"
+        elif re.search(r"(?i)(不要|不得|必须|只能|切记|禁止|\bmust\b|\bmust not\b|\bdo not\b|\bnever\b|\bonly\b)", text):
+            note_type = "constraint"
+        elif re.search(r"(?i)(决定采用|确定采用|方案确定|按照.{0,40}方案|\bdecided to\b|\bwe will use\b)", text):
+            note_type = "decision"
+        if not note_type:
+            return None
+        note_text = clip(text, 500)
+        self.memory.append_note(
+            note_text,
+            tags=(note_type, "user_request"),
+            source="user_request",
+            note_type=note_type,
+            scope="session",
+            evidence=("user:current_request",),
+        )
+        self.session["memory"] = self.memory.to_dict()
+        return note_type
 
     def ask(self, user_message):
         """
@@ -1182,6 +1305,7 @@ class Codini:
         run_started_at = time.monotonic()
         self._trace_started_at = run_started_at
         self.memory.set_task_summary(user_message)
+        self.capture_user_typed_note(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
         task_state = TaskState.create(
@@ -1209,6 +1333,27 @@ class Codini:
         task_state._run_inherited["session_id"] = task_state.session_id
         task_state._run_inherited["parent_span_id"] = task_state.parent_span_id
         task_state._trace_started_at = run_started_at
+        step_budget = DynamicStepBudget(self.max_steps)
+        task_state.initial_step_limit = step_budget.initial_limit
+        task_state.soft_step_limit = step_budget.soft_limit
+        task_state.hard_step_limit = step_budget.hard_limit
+        task_state.budget_extensions = step_budget.extension_count
+        task_state.recent_progress_score = step_budget.recent_progress_score
+        task_state.no_progress_count = step_budget.no_progress_count
+        task_state.progress_reasons = []
+        task_state.semantic_repeat_count = step_budget.semantic_repeat_count
+        task_state.last_semantic_reason = ""
+        task_state.last_semantic_signature = ""
+        task_state._run_inherited["initial_step_limit"] = step_budget.initial_limit
+        task_state._run_inherited["soft_step_limit"] = step_budget.soft_limit
+        task_state._run_inherited["hard_step_limit"] = step_budget.hard_limit
+        task_state._run_inherited["budget_extensions"] = step_budget.extension_count
+        task_state._run_inherited["recent_progress_score"] = step_budget.recent_progress_score
+        task_state._run_inherited["no_progress_count"] = step_budget.no_progress_count
+        task_state._run_inherited["progress_reasons"] = []
+        task_state._run_inherited["semantic_repeat_count"] = step_budget.semantic_repeat_count
+        task_state._run_inherited["last_semantic_reason"] = ""
+        task_state._run_inherited["last_semantic_signature"] = ""
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
         self._run_accum = {
@@ -1230,13 +1375,16 @@ class Codini:
             "parent_span_id": task_state.parent_span_id,
             "depth": task_state.depth,
             "task_id": task_state.task_id,
-            "user_request": user_message
+            "user_request": user_message,
+            "initial_step_limit": step_budget.initial_limit,
+            "soft_step_limit": step_budget.soft_limit,
+            "hard_step_limit": step_budget.hard_limit,
         })
         run_span_token = self.tracer._active_span_var.set(run_span)
 
         tool_steps = 0
         attempts = 0
-        max_attempts = max(self.max_steps * 3, self.max_steps + 4)
+        max_attempts = max(step_budget.initial_limit * 3, step_budget.initial_limit + 4)
         pending_error = None
 
         try:
@@ -1246,7 +1394,58 @@ class Codini:
             # 3. 行动：如果是工具调用，就执行工具
             # 4. 记录：把结果写回 history / task_state / trace / memory
             # 然后进入下一轮，直到停机条件满足
-            while tool_steps < self.max_steps and attempts < max_attempts:
+            while True:
+                if step_budget.should_stop:
+                    observation = step_budget.last_observation
+                    run_span.add_event(
+                        "guard.blocked",
+                        {
+                            "reason": "no_progress_detected",
+                            "no_progress_count": observation.no_progress_count,
+                            "progress_reasons": list(observation.reasons),
+                            "recent_progress_score": step_budget.recent_progress_score,
+                            "tool_steps": tool_steps,
+                        },
+                    )
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="guard.blocked",
+                        related_span_id=run_span.span_id,
+                        related_event="guard.blocked",
+                    )
+                    break
+                if not step_budget.has_capacity(tool_steps):
+                    extension = step_budget.try_extend(tool_steps)
+                    if extension is None:
+                        break
+                    task_state.soft_step_limit = extension.new_limit
+                    task_state.budget_extensions = extension.extension_count
+                    task_state._run_inherited["soft_step_limit"] = extension.new_limit
+                    task_state._run_inherited["budget_extensions"] = extension.extension_count
+                    max_attempts = max(
+                        max_attempts,
+                        extension.new_limit * 3,
+                        extension.new_limit + 4,
+                    )
+                    run_span.add_event(
+                        "budget.extended",
+                        {
+                            "previous_limit": extension.previous_limit,
+                            "new_limit": extension.new_limit,
+                            "hard_limit": extension.hard_limit,
+                            "extension_count": extension.extension_count,
+                            "recent_progress_score": extension.recent_progress_score,
+                            "tool_steps": tool_steps,
+                        },
+                    )
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="budget.extended",
+                        related_span_id=run_span.span_id,
+                        related_event="budget.extended",
+                    )
+                if attempts >= max_attempts:
+                    break
                 attempts += 1
                 task_state.record_attempt()
                 self.run_store.write_task_state(
@@ -1341,6 +1540,8 @@ class Codini:
                 llm_attrs = {
                     "attempts": task_state.attempts,
                     "tool_steps": task_state.tool_steps,
+                    "max_steps": step_budget.soft_limit,
+                    "hard_step_limit": step_budget.hard_limit,
                     "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
                     "prompt_cache_requested": bool(prompt_cache_key),
                     "prompt_cache_key": prompt_cache_key,
@@ -1392,15 +1593,79 @@ class Codini:
 
                     with self.tracer.span_scope(f"tool.{name or 'unknown'}", tool_attrs) as tool_span:
                         tool_started_at = time.monotonic()
-                        self.current_tool_span_id = tool_span.span_id
-                        try:
-                            result = self.run_tool(name, args)
-                        finally:
-                            self.current_tool_span_id = ""
+                        semantic_decision = step_budget.check_semantic_repeat(name, args)
+                        task_state.semantic_repeat_count = step_budget.semantic_repeat_count
+                        task_state.last_semantic_reason = semantic_decision.reason
+                        task_state.last_semantic_signature = semantic_decision.signature
+                        task_state._run_inherited["semantic_repeat_count"] = step_budget.semantic_repeat_count
+                        task_state._run_inherited["last_semantic_reason"] = semantic_decision.reason
+                        task_state._run_inherited["last_semantic_signature"] = semantic_decision.signature
+
+                        if semantic_decision.warning:
+                            semantic_event = "guard.blocked" if semantic_decision.blocked else "guard.warning"
+                            run_span.add_event(
+                                semantic_event,
+                                {
+                                    "reason": semantic_decision.reason,
+                                    "semantic_signature": semantic_decision.signature,
+                                    "semantic_intent": semantic_decision.intent,
+                                    "repeat_count": semantic_decision.repeat_count,
+                                    "cycle_length": semantic_decision.cycle_length,
+                                    "tool_steps": tool_steps,
+                                    "tool_name": name,
+                                },
+                            )
+
+                        if semantic_decision.blocked:
+                            result = step_budget.semantic_feedback(semantic_decision)
+                            self._last_tool_result_metadata = {
+                                "tool_status": "rejected",
+                                "tool_error_code": "semantic_repeat",
+                                "security_event_type": "",
+                                "risk_level": "high" if risky else "low",
+                                "read_only": not risky,
+                                "affected_paths": [],
+                                "workspace_changed": False,
+                                "diff_summary": [],
+                                "diffs": [],
+                            }
+                        else:
+                            self.current_tool_span_id = tool_span.span_id
+                            try:
+                                result = self.run_tool(name, args)
+                            finally:
+                                self.current_tool_span_id = ""
                         tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
 
                         tool_status = (self._last_tool_result_metadata or {}).get("tool_status", "ok")
                         success = tool_status not in ("error", "rejected", "partial_success")
+                        tool_result_meta = dict(self._last_tool_result_metadata or {})
+                        observation = step_budget.observe(name, args, result, tool_result_meta)
+                        task_state.recent_progress_score = step_budget.recent_progress_score
+                        task_state.no_progress_count = observation.no_progress_count
+                        task_state.progress_reasons = list(observation.reasons)
+                        task_state._run_inherited["recent_progress_score"] = step_budget.recent_progress_score
+                        task_state._run_inherited["no_progress_count"] = observation.no_progress_count
+                        task_state._run_inherited["progress_reasons"] = list(observation.reasons)
+
+                        recorded_result = result
+                        if semantic_decision.warning and not semantic_decision.blocked:
+                            semantic_feedback = step_budget.semantic_feedback(semantic_decision)
+                            recorded_result = f"{recorded_result}\n\n{semantic_feedback}".strip()
+                        if observation.should_warn:
+                            feedback = step_budget.warning_feedback()
+                            recorded_result = f"{result}\n\n{feedback}".strip()
+                            run_span.add_event(
+                                "guard.warning",
+                                {
+                                    "reason": "no_progress",
+                                    "no_progress_count": observation.no_progress_count,
+                                    "progress_reasons": list(observation.reasons),
+                                    "recent_progress_score": step_budget.recent_progress_score,
+                                    "tool_steps": tool_steps,
+                                    "tool_name": name,
+                                },
+                            )
 
                         self._accum_tool(name, duration_ms=tool_duration_ms)
                         self.record(
@@ -1408,7 +1673,7 @@ class Codini:
                                 "role": "tool",
                                 "name": name,
                                 "args": args,
-                                "content": result,
+                                "content": recorded_result,
                                 "created_at": now(),
                             }
                         )
@@ -1418,7 +1683,6 @@ class Codini:
                             related_span_id=tool_span.span_id,
                             related_event="tool_executed",
                         )
-                        tool_result_meta = dict(self._last_tool_result_metadata or {})
                         exit_code = tool_result_meta.get("exit_code")
                         if exit_code is None and name == "run_shell":
                             match = re.search(r"exit_code:\s*(-?\d+)", result)
@@ -1426,13 +1690,13 @@ class Codini:
                         security_event = tool_result_meta.get("security_event_type") or ""
                         full_error = ""
                         if tool_result_meta.get("tool_status") in {"error", "partial_success", "rejected"}:
-                            full_error = str(result or "")
+                            full_error = str(recorded_result or "")
 
                         tool_span.set_attributes({
                             "name": name,
                             "args": args,
-                            "result": clip(result, 800),
-                            "result_full": full_error or clip(result, 2000),
+                            "result": clip(recorded_result, 800),
+                            "result_full": full_error or clip(recorded_result, 2000),
                             "full_error": full_error,
                             "exit_code": exit_code,
                             "security_event_type": security_event,
@@ -1447,6 +1711,16 @@ class Codini:
                             "child_run_id": tool_result_meta.get("child_run_id"),
                             "child_trace_id": tool_result_meta.get("child_trace_id"),
                             "diffs": tool_result_meta.get("diffs", []),
+                            "progress_score": observation.score,
+                            "progress_reasons": list(observation.reasons),
+                            "no_progress_count": observation.no_progress_count,
+                            "semantic_repeat": semantic_decision.warning,
+                            "semantic_repeat_blocked": semantic_decision.blocked,
+                            "semantic_reason": semantic_decision.reason,
+                            "semantic_signature": semantic_decision.signature,
+                            "semantic_intent": semantic_decision.intent,
+                            "semantic_repeat_count": semantic_decision.repeat_count,
+                            "semantic_cycle_length": semantic_decision.cycle_length,
                             "success": success
                         })
 
@@ -1522,6 +1796,18 @@ class Codini:
                     "promotions": list(self.last_durable_promotions),
                     "rejections": list(self.last_durable_rejections),
                     "tools_summary": tools_viz,
+                    "step_budget": {
+                        "initial_limit": step_budget.initial_limit,
+                        "soft_limit": step_budget.soft_limit,
+                        "hard_limit": step_budget.hard_limit,
+                        "extensions": step_budget.extension_count,
+                        "recent_progress_score": step_budget.recent_progress_score,
+                        "no_progress_count": step_budget.no_progress_count,
+                        "progress_reasons": list(step_budget.last_observation.reasons),
+                        "semantic_repeat_count": step_budget.semantic_repeat_count,
+                        "last_semantic_reason": task_state.last_semantic_reason,
+                        "last_semantic_signature": task_state.last_semantic_signature,
+                    },
                     "prompt_metadata": self.last_prompt_metadata,
                     "completion_metadata": self.last_completion_metadata
                 })
@@ -1535,7 +1821,13 @@ class Codini:
                 run_span.finish()
                 return final
 
-            if attempts >= max_attempts and tool_steps < self.max_steps:
+            if step_budget.should_stop:
+                final = (
+                    "Stopped after repeated tool calls produced no new information. "
+                    "Resume with a different investigation strategy."
+                )
+                task_state.stop_no_progress(final)
+            elif attempts >= max_attempts:
                 final = "Stopped after too many malformed model responses without a valid tool call or final answer."
                 task_state.stop_retry_limit(final)
             else:
@@ -1572,6 +1864,18 @@ class Codini:
                 "promotions": list(self.last_durable_promotions),
                 "rejections": list(self.last_durable_rejections),
                 "tools_summary": [],
+                "step_budget": {
+                    "initial_limit": step_budget.initial_limit,
+                    "soft_limit": step_budget.soft_limit,
+                    "hard_limit": step_budget.hard_limit,
+                    "extensions": step_budget.extension_count,
+                    "recent_progress_score": step_budget.recent_progress_score,
+                    "no_progress_count": step_budget.no_progress_count,
+                    "progress_reasons": list(step_budget.last_observation.reasons),
+                    "semantic_repeat_count": step_budget.semantic_repeat_count,
+                    "last_semantic_reason": task_state.last_semantic_reason,
+                    "last_semantic_signature": task_state.last_semantic_signature,
+                },
                 "prompt_metadata": self.last_prompt_metadata,
                 "completion_metadata": self.last_completion_metadata
             })
@@ -1778,7 +2082,7 @@ class Codini:
                 "diffs": diffs,
                 **child_info,
             }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
+            self.record_process_note_for_tool(name, self._last_tool_result_metadata, args)
             return result
         except Exception as exc:
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -1800,7 +2104,7 @@ class Codini:
                 "diff_summary": diff_summary,
                 "diffs": diffs,
             }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
+            self.record_process_note_for_tool(name, self._last_tool_result_metadata, args)
             return f"error: tool {name} failed: {exc}"
 
     def repeated_tool_call(self, name, args):

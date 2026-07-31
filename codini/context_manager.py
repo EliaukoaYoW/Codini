@@ -8,30 +8,80 @@ Prompt 组装与上下文预算控制。
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 DEFAULT_TOTAL_BUDGET = 25000  # 整个 Prompt 允许的最大字符数
-DEFAULT_SECTION_BUDGETS = {
-    "prefix": 6000,          # 系统指令 + 工作区快照
-    "memory": 3000,          # 工作记忆（任务摘要 + 最近读过的文件）
-    "relevant_memory": 2500, # 根据当前请求召回的相关历史笔记
-    "history": 12500          # 本次会话的历史记录
+DEFAULT_SECTION_BUDGET_RATIOS = {
+    "prefix": 0.25,          # 系统指令 + 工作区快照
+    "memory": 0.15,          # 工作记忆（任务摘要 + 最近读过的文件）
+    "relevant_memory": 0.10, # 根据当前请求召回的相关历史笔记
+    "history": 0.50,         # 本次会话的历史记录
 }
+
+
+def section_budgets_for_total(total_budget: int) -> dict[str, int]:
+    """Scale the shared section proportions to a concrete total budget."""
+    total_budget = max(0, int(total_budget))
+    budgets = {
+        section: int(total_budget * ratio)
+        for section, ratio in DEFAULT_SECTION_BUDGET_RATIOS.items()
+    }
+    budgets["history"] += total_budget - sum(budgets.values())
+    return budgets
+
+
+DEFAULT_SECTION_BUDGETS = section_budgets_for_total(DEFAULT_TOTAL_BUDGET)
 
 # 每个部分的最小预算，防止模型输出为空
 DEFAULT_SECTION_FLOORS = {
     "prefix": 2400,
     "memory": 800,
-    "relevant_memory": 600,
+    "relevant_memory": 800,
     "history": 3000
 }
-# 当 Prompt 超预算时的压缩顺序
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
-# 拼接 Prompt 时各 Section 的排列顺序（从上到下）
-SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request")
+
+DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix") # 当 Prompt 超预算时的压缩顺序
+SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request") # 拼接 Prompt 时各 Section 的排列顺序（从上到下）
 CURRENT_REQUEST_SECTION = "current_request"  # 当前用户的请求环节
 RELEVANT_MEMORY_LIMIT = 3                    # 最多召回 3 条相关历史笔记
+DEFAULT_SECTION_WEIGHTS = {
+    "prefix": 4.0,
+    "memory": 2.0,
+    "relevant_memory": 1.0,
+    "history": 2.0,
+}
+CONTINUATION_PATTERN = re.compile(
+    r"(?i)(继续|接着|刚才|之前|上次|前面|上述|基于此|"
+    r"\bcontinue\b|\bearlier\b|\bprevious\b|\blast time\b|\babove\b)"
+)
+WORKING_MEMORY_PATTERN = re.compile(
+    r"(?i)(修改|修复|实现|重构|文件|代码|函数|类|模块|"
+    r"\bedit\b|\bfix\b|\bimplement\b|\brefactor\b|\bfile\b|\bcode\b|\bfunction\b|\bclass\b|"
+    r"(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+)"
+)
+
+
+def _typed_note_text(note: dict[str, Any]) -> str:
+    """ 
+    把一条 note 转换为面向模型的文本表示。
+
+    输入:
+      - note: dict，必须包含至少 text、note_type、scope 三个字段。
+        - note_type 取值： "observation" | "decision" | "constraint" | "preference" | "error_resolution"
+        - scope 取值： "session" | "project" | "file"
+      - 输出："[note_type/scope] text" 格式
+
+    在 agent 链路里的位置：
+      被 `WorkspaceContext.get_relevant_notes()` 内部调用，用于把历史笔记转换为
+      发送给模型的带标记文本。
+    """
+    text = str(note.get("text", "")).strip()
+    note_type = str(note.get("note_type", "observation")).strip() or "observation"
+    scope = str(note.get("scope", "session")).strip() or "session"
+    return f"[{note_type}/{scope}] {text}"
+
 
 def _tail_clip(text: Any, limit: int) -> str:
     """ 
@@ -49,6 +99,19 @@ def _tail_clip(text: Any, limit: int) -> str:
     if limit <= 3:
         return text[:limit]
     return text[:limit-3] + "..."
+
+
+def _relevance_terms(text: Any) -> set[str]:
+    """Return lightweight English/path tokens and Chinese bigrams."""
+    value = str(text).lower()
+    terms = set(re.findall(r"[a-z0-9_./\\-]+", value))
+    for segment in re.findall(r"[\u4e00-\u9fff]+", value):
+        if len(segment) == 1:
+            terms.add(segment)
+            continue
+        terms.update(segment[index:index + 2] for index in range(len(segment) - 1))
+    return terms
+
 
 @dataclass
 class SectionRender:
@@ -76,16 +139,20 @@ class ContextManager:
         total_budget = DEFAULT_TOTAL_BUDGET,    # 整个 Prompt 允许的最大字符数
         section_budgets = None,                 # 每个部分的预算
         section_floors = None,                  # 每个部分的最小预算
-        reduction_order = None                  # 当 Prompt 超预算时的压缩顺序
+        reduction_order = None,                 # 当 Prompt 超预算时的压缩顺序
+        budget_strategy = "dynamic",            # dynamic / fixed
     ):
         self.agent = agent
         self.total_budget = int(total_budget)
-        self.section_budgets = dict(DEFAULT_SECTION_BUDGETS)
+        self.section_budgets = section_budgets_for_total(self.total_budget)
         if section_budgets:
             self.section_budgets.update({str(key): int(value) for key, value in section_budgets.items()})
         self._section_floor_overrides = {str(key): int(value) for key, value in (section_floors or {}).items()}
         self.section_floors = self._compute_section_floors()
         self.reduction_order = tuple(reduction_order or DEFAULT_REDUCTION_ORDER)
+        self.budget_strategy = str(budget_strategy).strip().lower()
+        if self.budget_strategy not in {"dynamic", "fixed"}:
+            raise ValueError(f"unsupported context budget strategy: {budget_strategy}")
         
     def build(self, user_message: Any) -> tuple[str, dict[str, Any]]:
         """ 功能: 按预算组装一轮完整 prompt。
@@ -145,7 +212,18 @@ class ContextManager:
             )
             return prompt, metadata
 
-        budgets = dict(self.section_budgets)
+        if self.budget_strategy == "fixed":
+            budgets, allocation = self._allocate_fixed_budgets(
+                section_texts,
+                selected_notes,
+            )
+        else:
+            budgets, allocation = self._allocate_dynamic_budgets(
+                section_texts,
+                selected_notes,
+                user_message,
+            )
+        effective_reduction_order = tuple(allocation["reduction_order"])
         rendered = self._render_sections(section_texts, budgets, selected_notes = selected_notes)
         prompt = self._assemble_prompt(rendered)
         reduction_log = []
@@ -154,7 +232,7 @@ class ContextManager:
         while len(prompt) > self.total_budget:
             overflow = len(prompt) - self.total_budget
             reduced = False
-            for section in self.reduction_order:
+            for section in effective_reduction_order:
                 floor = int(self.section_floors.get(section, 0))
                 current_budget = int(budgets.get(section, 0))
                 if current_budget <= floor:
@@ -177,6 +255,11 @@ class ContextManager:
                 break
             if not reduced:
                 break
+        allocation["allocated_chars"] = dict(budgets)
+        allocation["unused_chars"] = max(
+            0,
+            int(allocation["available_chars"]) - sum(budgets.values()),
+        )
         metadata = self._metadata(
             prompt = prompt,
             rendered = rendered,
@@ -184,7 +267,9 @@ class ContextManager:
             reduction_log = reduction_log,
             selected_notes = selected_notes,
             user_message = user_message,
-            section_texts = section_texts
+            section_texts = section_texts,
+            allocation = allocation,
+            effective_reduction_order = effective_reduction_order,
         )
         return prompt, metadata
         
@@ -198,12 +283,12 @@ class ContextManager:
         selected_notes = selected_notes or []
         relevant_lines = ["Relevant Memory:"]
         if selected_notes:
-            relevant_lines.extend(f"- {note['text']}" for note in selected_notes)
+            relevant_lines.extend(f"- {_typed_note_text(note)}" for note in selected_notes)
         else:
             relevant_lines.append("- none")
         relevant_raw = "\n".join(relevant_lines)
         history = list(getattr(self.agent, "session", {}).get("history", []))
-        history_raw = self._render_history_text(history)
+        history_raw = self._raw_history_text(history)
         return {
             "prefix": SectionRender(raw = section_texts["prefix"], budget = len(section_texts["prefix"]), rendered = section_texts["prefix"], details = {}),
             "memory": SectionRender(raw = section_texts["memory"], budget = len(section_texts["memory"]), rendered = section_texts["memory"], details = {}),
@@ -231,17 +316,216 @@ class ContextManager:
 
     def _compute_section_floors(self) -> dict[str, int]:
         """
-        计算每个 section 压缩时的最低保障线（floor）
+        计算每个 section 超出预算后进行压缩时的最低保障线（floor）
         输入: 无
         输出: 各 section 对应的最低保障线（floor）
         用途: 当 Prompt 超预算时，根据压缩顺序压缩每个 section 直至不超过 total_budget
         """
-        floors = {
-            section: max(20, int(budget) // 4)
-            for section, budget in self.section_budgets.items()
-        }
+        floors = {}
+        for section, budget in self.section_budgets.items():
+            budget = max(0, int(budget))
+            if budget == int(DEFAULT_SECTION_BUDGETS.get(section, -1)):
+                floor = int(DEFAULT_SECTION_FLOORS.get(section, max(20, budget // 2)))
+            else:
+                floor = max(20, budget // 2)
+            floors[section] = min(budget, floor)
         floors.update(self._section_floor_overrides)
         return floors
+
+    def _allocate_fixed_budgets(
+        self,
+        section_texts: dict[str, str],
+        selected_notes: list[dict[str, Any]],
+    ) -> tuple[dict[str, int], dict[str, Any]]:
+        """Allocate the same hard budget using fixed configured section shares."""
+        sections = list(SECTION_ORDER[:-1])
+        history = list(getattr(self.agent, "session", {}).get("history", []))
+        raw_sections = {
+            "prefix": section_texts["prefix"],
+            "memory": section_texts["memory"],
+            "relevant_memory": self._relevant_memory_raw(selected_notes),
+            "history": self._raw_history_text(history),
+        }
+        demands = {section: len(raw_sections[section]) for section in sections}
+        separator_chars = 2 * (len(SECTION_ORDER) - 1)
+        current_request_chars = len(section_texts[CURRENT_REQUEST_SECTION])
+        available = max(0, self.total_budget - current_request_chars - separator_chars)
+        configured_total = max(
+            1,
+            sum(max(0, int(self.section_budgets.get(section, 0))) for section in sections),
+        )
+        quotas = {
+            section: int(
+                available
+                * max(0, int(self.section_budgets.get(section, 0)))
+                / configured_total
+            )
+            for section in sections
+        }
+        quotas["history"] += available - sum(quotas.values())
+        budgets = {
+            section: min(demands[section], quotas[section])
+            for section in sections
+        }
+        floors = {
+            section: min(demands[section], max(0, int(self.section_floors.get(section, 0))))
+            for section in sections
+        }
+        allocation = {
+            "strategy": "fixed",
+            "available_chars": available,
+            "current_request_chars": current_request_chars,
+            "separator_chars": separator_chars,
+            "configured_budgets": {
+                section: int(self.section_budgets.get(section, 0))
+                for section in sections
+            },
+            "demand_chars": demands,
+            "floor_chars": floors,
+            "weights": {},
+            "signals": {section: ["fixed_share"] for section in sections},
+            "allocated_chars": dict(budgets),
+            "unused_chars": max(0, available - sum(budgets.values())),
+            "reduction_order": list(self.reduction_order),
+        }
+        return budgets, allocation
+
+    def _allocate_dynamic_budgets(
+        self,
+        section_texts: dict[str, str],
+        selected_notes: list[dict[str, Any]],
+        user_message: str,
+    ) -> tuple[dict[str, int], dict[str, Any]]:
+        """ 
+        从低到高（从 floor 到 budget）确定每个 section 的最终分配字符数。
+        未用完的空间会自动补给 relevant_memory，避免浪费。 
+        """
+        sections = list(SECTION_ORDER[:-1])
+        relevant_raw = self._relevant_memory_raw(selected_notes)
+        history = list(getattr(self.agent, "session", {}).get("history", []))
+        raw_sections = {
+            "prefix": section_texts["prefix"],
+            "memory": section_texts["memory"],
+            "relevant_memory": relevant_raw,
+            "history": self._raw_history_text(history),
+        }
+        relevance_history = history
+        if (
+            history
+            and history[-1].get("role") == "user"
+            and str(history[-1].get("content", "")) == user_message
+        ):
+            relevance_history = history[:-1]
+        relevance_texts = dict(raw_sections)
+        relevance_texts["history"] = self._raw_history_text(relevance_history)
+
+        separator_chars = 2 * (len(SECTION_ORDER) - 1)
+        current_request_chars = len(section_texts[CURRENT_REQUEST_SECTION])
+        available = max(0, self.total_budget - current_request_chars - separator_chars)
+        demands = {section: len(raw_sections[section]) for section in sections}
+        floors = {
+            section: min(demands[section], max(0, int(self.section_floors.get(section, 0))))
+            for section in sections
+        }
+
+        configured_total = max(1, sum(max(0, int(value)) for value in self.section_budgets.values()))
+        query_terms = _relevance_terms(user_message)
+        weights = {}
+        signals = {section: [] for section in sections}
+        for section in sections:
+            configured_share = max(0, int(self.section_budgets.get(section, 0))) / configured_total
+            weight = float(DEFAULT_SECTION_WEIGHTS[section]) + configured_share
+            section_terms = _relevance_terms(relevance_texts[section])
+            overlap = len(query_terms & section_terms)
+            if overlap:
+                overlap_boost = min(3.0, overlap / max(1, min(len(query_terms), 12)) * 4.0)
+                weight += overlap_boost
+                signals[section].append(f"query_overlap:{overlap}")
+            weights[section] = weight
+
+        if selected_notes:
+            note_boost = min(3.0, 1.0 + len(selected_notes) * 0.75)
+            weights["relevant_memory"] += note_boost
+            signals["relevant_memory"].append(f"retrieved_notes:{len(selected_notes)}")
+        if CONTINUATION_PATTERN.search(user_message):
+            weights["history"] += 3.0
+            signals["history"].append("continuation_request")
+        if WORKING_MEMORY_PATTERN.search(user_message):
+            weights["memory"] += 2.0
+            signals["memory"].append("workspace_task")
+        signals["prefix"].append("protected_core")
+
+        budgets = {section: 0 for section in sections}
+        remaining = available
+        # 为每个 section 分配最低保底字符数 floors
+        remaining = self._distribute_budget(budgets, floors, weights, remaining)
+        # 为每个 section 分配实际需求字符数 demands
+        remaining = self._distribute_budget(budgets, demands, weights, remaining)
+
+        tie_break = {section: index for index, section in enumerate(self.reduction_order)}
+        reducible = [section for section in sections if section != "prefix"]
+        dynamic_reduction_order = sorted(
+            reducible,
+            key=lambda section: (weights[section], tie_break.get(section, len(tie_break))),
+        )
+        dynamic_reduction_order.append("prefix")
+
+        allocation = {
+            "strategy": "dynamic_relevance",
+            "available_chars": available,
+            "current_request_chars": current_request_chars,
+            "separator_chars": separator_chars,
+            "configured_budgets": {
+                section: int(self.section_budgets.get(section, 0))
+                for section in sections
+            },
+            "demand_chars": demands,
+            "floor_chars": floors,
+            "weights": {section: round(weights[section], 3) for section in sections},
+            "signals": signals,
+            "allocated_chars": dict(budgets),
+            "unused_chars": remaining,
+            "reduction_order": dynamic_reduction_order,
+        }
+        return budgets, allocation
+
+    @staticmethod
+    def _distribute_budget(
+        budgets: dict[str, int],
+        targets: dict[str, int],
+        weights: dict[str, float],
+        remaining: int,
+    ) -> int:
+        """Proportionally fill section targets without exceeding the shared pool."""
+        remaining = max(0, int(remaining))
+        section_order = {section: index for index, section in enumerate(SECTION_ORDER)}
+        while remaining > 0:
+            active = [
+                section
+                for section, target in targets.items()
+                if budgets.get(section, 0) < max(0, int(target))
+            ]
+            if not active:
+                break
+            active.sort(key=lambda section: (-weights.get(section, 1.0), section_order.get(section, 99)))
+            total_weight = sum(max(0.01, weights.get(section, 1.0)) for section in active)
+            round_budget = remaining
+            distributed = 0
+            for section in active:
+                if remaining <= 0:
+                    break
+                need = max(0, int(targets[section]) - budgets.get(section, 0))
+                share = max(
+                    1,
+                    int(round_budget * max(0.01, weights.get(section, 1.0)) / total_weight),
+                )
+                grant = min(need, share, remaining)
+                budgets[section] = budgets.get(section, 0) + grant
+                remaining -= grant
+                distributed += grant
+            if distributed <= 0:
+                break
+        return remaining
     
     def _render_sections(self, section_texts: dict[str, str], budgets: dict[str, int], selected_notes: list[dict[str, Any]] | None = None) -> dict[str, SectionRender]:
         """
@@ -266,9 +550,20 @@ class ContextManager:
             else:
                 # prefix 和 memory 直接裁剪
                 raw = section_texts[section]
-                rendered_text = _tail_clip(raw, int(budget)) if budget else raw
+                rendered_text = _tail_clip(raw, max(0, int(budget or 0)))
                 rendered[section] = SectionRender(raw = raw, budget = int(budget or 0),  rendered = rendered_text, details = {})
         return rendered
+
+    @staticmethod
+    def _relevant_memory_raw(selected_notes: list[dict[str, Any]]) -> str:
+        """ 格式化相关的笔记作为输入 """
+        header = "Relevant Memory:"
+        note_texts = [
+            _typed_note_text(note)
+            for note in selected_notes
+            if str(note.get("text", "")).strip()
+        ]
+        return "\n".join([header] + [f"- {text}" for text in note_texts]) if note_texts else "\n".join([header, "- none"])
     
     def _render_relevant_memory(self, selected_notes: list[dict[str, Any]], budget: int) -> SectionRender:
         """
@@ -278,11 +573,28 @@ class ContextManager:
         用途: 当 Prompt 超预算时，根据压缩顺序压缩相关记忆 section 直至不超过 total_budget
         """
         header = "Relevant Memory:"
-        note_texts = [str(note.get("text", "")) for note in selected_notes if str(note.get("text", "")).strip()]
-        raw_lines = [header] + [f"- {text}" for text in note_texts]
-        raw = "\n".join(raw_lines) if note_texts else "\n".join([header, "- none"])
+        # 提取 note 文本并附带类型和作用域标记
+        note_texts = [
+            _typed_note_text(note)
+            for note in selected_notes
+            if str(note.get("text", "")).strip()
+        ]
+        raw = self._relevant_memory_raw(selected_notes)
+        if budget <= 0:
+            return SectionRender(
+                raw=raw,
+                budget=budget,
+                rendered="",
+                details={
+                    "selected_notes": note_texts,
+                    "rendered_notes": [],
+                    "selected_count": len(note_texts),
+                    "rendered_count": 0,
+                    "note_budget": 0,
+                },
+            )
         if not note_texts:
-            rendered = raw
+            rendered = _tail_clip(raw, budget)
             return SectionRender(
                 raw=raw, budget=budget, rendered=rendered, 
                 details={
@@ -342,8 +654,19 @@ class ContextManager:
         """
         history = list(getattr(self.agent, "session", {}).get("history", []))
         raw = self._raw_history_text(history)
+        if budget <= 0:
+            return SectionRender(
+                raw=raw,
+                budget=budget,
+                rendered="",
+                details={
+                    "recent_window": 6,
+                    "recent_start": max(0, len(history) - 6),
+                    "rendered_entries": [],
+                },
+            )
         if not history:
-            rendered = "Transcript:\n- empty"
+            rendered = _tail_clip(raw, budget)
             return SectionRender(
                 raw = raw, budget = budget, rendered = rendered, 
                 details = {
@@ -558,7 +881,9 @@ class ContextManager:
         reduction_log: list[dict[str, Any]], 
         selected_notes: list[dict[str, Any]], 
         user_message: str, 
-        section_texts: dict[str, str]
+        section_texts: dict[str, str],
+        allocation: dict[str, Any] | None = None,
+        effective_reduction_order: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
@@ -580,24 +905,33 @@ class ContextManager:
             "prompt_budget_chars": self.total_budget,
             "prompt_over_budget": len(prompt) > self.total_budget,
             "section_order": list(SECTION_ORDER),
+            "budget_strategy": (allocation or {}).get("strategy", "disabled"),
+            "budget_allocation": allocation or {},
             "section_budgets": {
                 section: (None if section == CURRENT_REQUEST_SECTION else int(budgets.get(section, 0)))
                 for section in SECTION_ORDER
             },
             "sections": section_metadata,
             "budget_reductions": reduction_log,
-            "reduction_order": list(self.reduction_order),
+            "reduction_order": list(effective_reduction_order or self.reduction_order),
             "relevant_memory": {
                 "limit": RELEVANT_MEMORY_LIMIT,
                 "selected_count": len(selected_notes),
                 "selected_notes": [note["text"] for note in selected_notes],
                 "selected_source": [str(note.get("source", "")) for note in selected_notes],
                 "selected_kinds": [str(note.get("kind", "episodic")).strip() or "episodic" for note in selected_notes],
+                "selected_note_types": [str(note.get("note_type", "observation")) for note in selected_notes],
+                "selected_scopes": [str(note.get("scope", "session")) for note in selected_notes],
+                "selected_scope_refs": [
+                    list(note.get("scope_refs", []))
+                    for note in selected_notes
+                ],
+                "selected_evidence": [list(note.get("evidence", [])) for note in selected_notes],
                 "selected_durable_count": sum(
                     1 for note in selected_notes if (str(note.get("kind", "episodic")).strip() or "episodic") == "durable"
                 ),
-                "raw_chars": rendered["history"].raw_chars,
-                "rendered_chars": rendered["history"].rendered_chars,
+                "raw_chars": rendered["relevant_memory"].raw_chars,
+                "rendered_chars": rendered["relevant_memory"].rendered_chars,
                 "rendered_notes": list(rendered["relevant_memory"].details.get("rendered_notes", [])),
                 "rendered_count": int(rendered["relevant_memory"].details.get("rendered_count", 0)),
             },

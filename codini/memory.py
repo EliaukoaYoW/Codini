@@ -20,6 +20,21 @@ from .workspace import clip, now
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
 FILE_SUMMARY_LIMIT = 6
+EPISODIC_NOTE_TYPES = {
+    "observation",
+    "decision",
+    "constraint",
+    "preference",
+    "error_resolution",
+}
+EPISODIC_NOTE_SCOPES = {"session", "project", "file"}
+EPISODIC_NOTE_STATUSES = {"active", "stale", "superseded"}
+DURABLE_TOPIC_NOTE_TYPES = {
+    "project-conventions": "constraint",
+    "key-decisions": "decision",
+    "dependency-facts": "observation",
+    "user-preferences": "preference",
+}
 
 DURABLE_TOPIC_DEFAULTS = {
     "project-conventions": {
@@ -121,7 +136,12 @@ class DurableMemoryStore:
                         "tags": tags,
                         "source": topic,
                         "created_at": updated_at or now(),
-                        "kind": "durable"
+                        "kind": "durable",
+                        "note_type": DURABLE_TOPIC_NOTE_TYPES.get(topic, "observation"),
+                        "scope": "project",
+                        "evidence": [f"durable:{topic}"],
+                        "freshness": {},
+                        "status": "active",
                     }
                 )
         return notes
@@ -152,8 +172,8 @@ class DurableMemoryStore:
             for note in notes:
                 note_tags = {tag.lower() for tag in note.get("tags", [])}
                 note_tokens = _tokenize(note.get("text", ""))
-                exact_tag_match = int(bool(query_tokens & note_tags))
-                keyword_overlap = len(query_tokens & note_tokens)
+                exact_tag_match = int(bool(query_tokens & note_tags))   # 标签完全匹配
+                keyword_overlap = len(query_tokens & note_tokens)       # 关键词匹配
                 if exact_tag_match == 0 and keyword_overlap == 0:
                     continue
                 recency = _parse_timestamp(note.get("created_at"))
@@ -290,7 +310,13 @@ def file_freshness(raw_path, workspace_root=None):
 
 
 def _tokenize(text):
-    return {token.lower() for token in  re.findall(r"[A-Za-z0-9_]+", str(text))}
+    """ 将输入的文本切分为用于文本检索与相关度计算的 token """
+    value = str(text)
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", value)}
+    for segment in re.findall(r"[\u4e00-\u9fff]+", value):
+        tokens.update(segment)
+        tokens.update(segment[index:index + 2] for index in range(max(0, len(segment) - 1)))
+    return tokens
 
 
 def _parse_timestamp(value):
@@ -302,40 +328,70 @@ def _parse_timestamp(value):
         return 0.0
 
 
-def _normalize_note(note, index):
+def _normalize_note(note, index, workspace_root=None):
     if isinstance(note, str):
-        text = clip(note.strip(), 500)
-        return {
-            "text": text,
-            "tags": [],
-            "source": "",
-            "created_at": now(),
-            "note_index": index,
-            "kind": "episodic"
-        }
-    if not isinstance(note, dict):
-        text = clip(str(note).strip(), 500)
-        return {
-            "text": text,
-            "tags": [],
-            "source": "",
-            "created_at": now(),
-            "note_index": index,
-            "kind": "episodic",
-        }
+        note = {"text": note}
+    elif not isinstance(note, dict):
+        note = {"text": str(note)}
+
     text = clip(str(note.get("text", "")).strip(), 500)
     tags = [str(tag).strip() for tag in _ensure_list(note.get("tags", [])) if str(tag).strip()]
     source = str(note.get("source", "")).strip()
     created_at = str(note.get("created_at", "")).strip() or now()
     note_index = int(note.get("note_index", index))
     kind = str(note.get("kind", "episodic")).strip() or "episodic"
+    note_type = str(note.get("note_type", note.get("type", "observation"))).strip()
+    if note_type not in EPISODIC_NOTE_TYPES:
+        note_type = "observation"
+    scope = str(note.get("scope", "session")).strip()
+    if scope not in EPISODIC_NOTE_SCOPES:
+        scope = "session"
+    raw_scope_refs = _ensure_list(note.get("scope_refs", []))
+    raw_freshness = note.get("freshness", {})
+    if scope == "file" and not raw_scope_refs and isinstance(raw_freshness, dict):
+        raw_scope_refs = list(raw_freshness)
+    scope_refs = _dedupe_preserve_order(
+        [
+            canonicalize_path(path, workspace_root)
+            for path in raw_scope_refs
+            if str(path).strip()
+        ]
+    )
+    status = str(note.get("status", "active")).strip()
+    if status not in EPISODIC_NOTE_STATUSES:
+        status = "active"
+    evidence = _dedupe_preserve_order(
+        [
+            clip(str(item).strip(), 240)
+            for item in _ensure_list(note.get("evidence", []))
+            if str(item).strip()
+        ]
+    )
+    freshness = {}
+    if isinstance(raw_freshness, dict):
+        for path, expected in raw_freshness.items():
+            canonical_path = canonicalize_path(path, workspace_root)
+            if not canonical_path:
+                continue
+            freshness[canonical_path] = None if expected in (None, "") else str(expected)
+    if status == "active" and workspace_root is not None:
+        for path, expected in freshness.items():
+            if file_freshness(path, workspace_root) != expected:
+                status = "stale"
+                break
     return {
         "text": text,
         "tags": _dedupe_preserve_order(tags),
         "source": source,
         "created_at": created_at,
         "note_index": note_index,
-        "kind": kind
+        "kind": kind,
+        "note_type": note_type,
+        "scope": scope,
+        "scope_refs": scope_refs,
+        "evidence": evidence,
+        "freshness": freshness,
+        "status": status,
     }
 
 
@@ -378,7 +434,7 @@ def normalize_memory_state(state, workspace_root=None):
     # 旧格式：笔记存在 state["notes"] 里（纯字符串列表）
     if not episodic_notes and state.get("notes"):
         episodic_notes = [
-            _normalize_note(note, index)
+            _normalize_note(note, index, workspace_root)
             for index, note in enumerate(_ensure_list(state.get("notes",[])))
             if str(note).strip()
         ]
@@ -388,7 +444,7 @@ def normalize_memory_state(state, workspace_root=None):
         for index, note in enumerate(episodic_notes):
             if isinstance(note, str) and not str(note).strip():
                 continue
-            normalized_notes.append(_normalize_note(note, index))
+            normalized_notes.append(_normalize_note(note, index, workspace_root))
         episodic_notes = normalized_notes
     episodic_notes = episodic_notes[-EPISODIC_NOTE_LIMIT:]
     state["episodic_notes"] = episodic_notes
@@ -453,7 +509,21 @@ def remember_file(state, path, workspace_root = None):
     state["files"] = list(state["working"]["recent_files"])
     return state
 
-def append_note(state, text, tags = (), source = "", created_at = None, workspace_root = None, kind = "episodic"):
+def append_note(
+    state,
+    text,
+    tags=(),
+    source="",
+    created_at=None,
+    workspace_root=None,
+    kind="episodic",
+    note_type="observation",
+    scope="session",
+    scope_refs=(),
+    evidence=(),
+    freshness_paths=(),
+    status="active",
+):
     state = normalize_memory_state(state, workspace_root)
     text = clip(str(text).strip(), 500)
     if not text:
@@ -469,10 +539,54 @@ def append_note(state, text, tags = (), source = "", created_at = None, workspac
         "created_at": str(created_at).strip() if created_at else now(),
         "note_index": int(state.get("next_note_index", 0)),
         "kind": str(kind).strip() or "episodic",
+        "note_type": str(note_type).strip(),
+        "scope": str(scope).strip(),
+        "scope_refs": _dedupe_preserve_order(
+            [
+                canonicalize_path(path, workspace_root)
+                for path in _ensure_list(scope_refs)
+                if str(path).strip()
+            ]
+        ),
+        "evidence": _dedupe_preserve_order(
+            [clip(str(item).strip(), 240) for item in _ensure_list(evidence) if str(item).strip()]
+        ),
+        "freshness": {
+            canonicalize_path(path, workspace_root): file_freshness(path, workspace_root)
+            for path in _ensure_list(freshness_paths)
+            if str(path).strip()
+        },
+        "status": str(status).strip(),
     }
+    note = _normalize_note(note, note["note_index"], workspace_root)
     state["next_note_index"] = note["note_index"] + 1
 
-    notes = [item for item in state["episodic_notes"] if item["text"] != note["text"]]
+    notes = []
+    new_subject = DurableMemoryStore._subject_key(note["text"])
+    supersedable_types = {"decision", "constraint", "preference"}
+    for item in state["episodic_notes"]:
+        same_scope_binding = (
+            item.get("scope") == note["scope"]
+            and set(item.get("scope_refs", [])) == set(note["scope_refs"])
+        )
+        same_note = (
+            item["text"] == note["text"]
+            and item.get("note_type") == note["note_type"]
+            and same_scope_binding
+        )
+        if same_note:
+            continue
+        if (
+            new_subject
+            and note["note_type"] in supersedable_types
+            and item.get("status") == "active"
+            and item.get("note_type") == note["note_type"]
+            and same_scope_binding
+            and DurableMemoryStore._subject_key(item.get("text", "")) == new_subject
+        ):
+            item = dict(item)
+            item["status"] = "superseded"
+        notes.append(item)
     notes.append(note)
     state["episodic_notes"] = notes[-EPISODIC_NOTE_LIMIT:]
     state["notes"] = [item["text"] for item in state["episodic_notes"]]
@@ -523,21 +637,84 @@ def summarize_read_result(result, limit=180):
     summary = " | ".join(lines[:3])
     return clip(summary, limit)
 
+
+def _note_type_relevance(note_type, query):
+    note_type = str(note_type or "observation")
+    query_tokens = _tokenize(query)
+    score = {
+        "constraint": 3,
+        "decision": 3,
+        "preference": 2,
+        "error_resolution": 2,
+        "observation": 1,
+    }.get(note_type, 0)
+    if query_tokens & {"error", "failed", "failure", "exception", "错误", "失败", "异常"}:
+        score += 3 if note_type == "error_resolution" else 0
+    if query_tokens & {"decision", "design", "architecture", "决策", "设计", "架构"}:
+        score += 2 if note_type == "decision" else 0
+    if query_tokens & {"preference", "style", "偏好", "风格"}:
+        score += 2 if note_type == "preference" else 0
+    return score
+
+
+def _query_file_refs(query, workspace_root=None):
+    path_pattern = re.compile(
+        r"(?<![A-Za-z0-9_.-])(?:[A-Za-z]:[/\\])?[A-Za-z0-9_.-]+"
+        r"(?:[/\\][A-Za-z0-9_.-]+)+"
+    )
+    return {
+        canonicalize_path(match.group(0), workspace_root).lower()
+        for match in path_pattern.finditer(str(query))
+    }
+
+
+def _scope_priority(note, query_file_refs):
+    scope = str(note.get("scope", "session")).strip()
+    if scope == "file":
+        scope_refs = {
+            str(path).replace("\\", "/").lower()
+            for path in note.get("scope_refs", [])
+            if str(path).strip()
+        }
+        if not scope_refs:
+            return 1
+        return 3 if scope_refs & query_file_refs else None
+    if scope == "session":
+        return 2
+    return 1
+
+
+def _note_conflict_key(note):
+    subject = DurableMemoryStore._subject_key(note.get("text", ""))
+    if not subject:
+        return None
+    return str(note.get("note_type", "observation")), subject
+
+
 def retrieval_candidates(state, query, limit=3, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
     query_tokens = _tokenize(query)
+    query_file_refs = _query_file_refs(query, workspace_root)
     ranked = []
     # 情景笔记
     for note in state["episodic_notes"]:
-        # 召回逻辑故意保持简单透明：先看 tag 精确命中，再看关键词重叠，最后看新旧程度。这里不引入 embedding。
+        if note.get("status", "active") != "active":
+            continue
+        # 召回逻辑故意保持简单透明：先看 tag 精确命中，再看关键词重叠，最后看新旧程度。
         note_tags = {tag.lower() for tag in note.get("tags", [])}
         note_tokens = _tokenize(note.get("text","")) | _tokenize(note.get("source","")) | note_tags
         exact_tag_match = int(bool(query_tokens & note_tags))
         keyword_overlap = len(query_tokens & note_tokens)
         if exact_tag_match == 0 and keyword_overlap == 0:
             continue
+        scope_priority = _scope_priority(note, query_file_refs)
+        if scope_priority is None:
+            continue
         recency = _parse_timestamp(note.get("created_at"))
-        ranked.append(((exact_tag_match, keyword_overlap, recency, -1), note))
+        type_relevance = _note_type_relevance(note.get("note_type"), query)
+        ranked.append(
+            ((scope_priority, exact_tag_match, type_relevance, keyword_overlap, recency), note)
+        )
         
     # 搜索 Durable Memory（磁盘上的持久笔记）
     if workspace_root is not None:
@@ -551,17 +728,32 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
                 keyword_overlap = len(query_tokens & note_tokens)
                 if exact_tag_match == 0 and keyword_overlap == 0:
                     continue
+                scope_priority = _scope_priority(note, query_file_refs)
+                if scope_priority is None:
+                    continue
                 recency = _parse_timestamp(note.get("created_at"))
-                ranked.append(((exact_tag_match, keyword_overlap, recency, -1), note))   
+                type_relevance = _note_type_relevance(note.get("note_type"), query)
+                ranked.append(
+                    (
+                        (scope_priority, exact_tag_match, type_relevance, keyword_overlap, recency),
+                        note,
+                    )
+                )
     ranked.sort(key=lambda item: item[0], reverse=True)
     
     seen_texts = set()
+    resolved_conflicts = set()
     merged = []
     for _, note in ranked:
         text = note.get("text", "")
         if text in seen_texts:
             continue
+        conflict_key = _note_conflict_key(note)
+        if conflict_key is not None and conflict_key in resolved_conflicts:
+            continue
         seen_texts.add(text)
+        if conflict_key is not None:
+            resolved_conflicts.add(conflict_key)
         merged.append(note)
     return merged[:limit]
 
@@ -595,7 +787,14 @@ def render_memory_text(state, workspace_root=None):
     else:
         lines.append("- file_summaries: -")
 
-    lines.append(f"- episodic_notes: {len(state['episodic_notes'])}")
+    active_notes = [note for note in state["episodic_notes"] if note.get("status") == "active"]
+    type_counts = {}
+    for note in active_notes:
+        note_type = note.get("note_type", "observation")
+        type_counts[note_type] = type_counts.get(note_type, 0) + 1
+    type_summary = ", ".join(f"{name}:{count}" for name, count in sorted(type_counts.items())) or "-"
+    lines.append(f"- episodic_notes: {len(active_notes)} active / {len(state['episodic_notes'])} total")
+    lines.append(f"- episodic_types: {type_summary}")
     durable_topics = state.get("durable_topics", [])
     lines.append(f"- durable_topics: {', '.join(durable_topics) or '-'}")
     return "\n".join(lines)
@@ -631,7 +830,20 @@ class LayeredMemory:
         self.state = remember_file(self.state, path, self.workspace_root)
         return self
 
-    def append_note(self, text, tags=(), source="", created_at=None, kind="episodic"):
+    def append_note(
+        self,
+        text,
+        tags=(),
+        source="",
+        created_at=None,
+        kind="episodic",
+        note_type="observation",
+        scope="session",
+        scope_refs=(),
+        evidence=(),
+        freshness_paths=(),
+        status="active",
+    ):
         self.state = append_note(
             self.state,
             text,
@@ -640,6 +852,12 @@ class LayeredMemory:
             created_at=created_at,
             workspace_root=self.workspace_root,
             kind=kind,
+            note_type=note_type,
+            scope=scope,
+            scope_refs=scope_refs,
+            evidence=evidence,
+            freshness_paths=freshness_paths,
+            status=status,
         )
         return self
 
