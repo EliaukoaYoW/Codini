@@ -11,6 +11,8 @@ DISPLAY_NAME = "Codini"
 DISPLAY_HANDLE = "codini"
 SUBTITLE = "Magic local coding agent"
 WELCOME_STATUS = "Ready to cast code spells"
+CLI_PANEL_MIN_WIDTH = 68
+CLI_PANEL_MAX_WIDTH = 84
 
 # ANSI Block Constants
 ANSI_RESET = "\x1b[0m"
@@ -22,6 +24,11 @@ BASE_MASCOT_HEIGHT = 36
 MASCOT_WIDTH = 28
 MASCOT_HEIGHT = 18
 MASCOT_TOP_PADDING_ROWS = 1
+
+
+def cli_panel_width(terminal_width: int) -> int:
+    """功能：统一 Welcome 与回答框宽度；输入：终端列数；输出：限制在 68–84 列的面板宽度。"""
+    return max(CLI_PANEL_MIN_WIDTH, min(int(terminal_width), CLI_PANEL_MAX_WIDTH))
 
 # Colors
 OUTLINE = "#334155"         # Slate-700
