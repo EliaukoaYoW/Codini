@@ -319,7 +319,7 @@ codini/
 ├── tools.py              # 工具白名单、校验与执行
 ├── run_store.py          # task state、trace、report 的持久化
 ├── models.py             # 模型 provider 客户端
-└── viz/
+└── trace/
     ├── trace.py          # span 与 trace 事件
     └── viewer.py         # 实时本地 viewer
 ```
