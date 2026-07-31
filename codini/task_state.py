@@ -29,6 +29,7 @@ STATUS_FAILED = "failed"
 STOP_REASON_FINAL_ANSWER_RETURNED = "final_answer_returned"
 STOP_REASON_STEP_LIMIT_REACHED = "step_limit_reached"
 STOP_REASON_RETRY_LIMIT_REACHED = "retry_limit_reached"
+STOP_REASON_NO_PROGRESS_DETECTED = "no_progress_detected"
 STOP_REASON_MODEL_ERROR = "model_error"
 STOP_REASON_TOOL_TIMEOUT = "tool_timeout"
 STOP_REASON_APPROVAL_DENIED = "approval_denied"
@@ -46,6 +47,16 @@ class TaskState:
     status: str = STATUS_RUNNING
     tool_steps: int = 0
     attempts: int = 0
+    initial_step_limit: int = 0
+    soft_step_limit: int = 0
+    hard_step_limit: int = 0
+    budget_extensions: int = 0
+    recent_progress_score: int = 0
+    no_progress_count: int = 0
+    progress_reasons: list = field(default_factory=list)
+    semantic_repeat_count: int = 0
+    last_semantic_reason: str = ""
+    last_semantic_signature: str = ""
     last_tool: str = ""
     stop_reason: str = ""
     final_answer: str = ""
@@ -53,6 +64,7 @@ class TaskState:
     checkpoint_id: str = ""
     resume_status: str = ""
 
+    # ---- trace 数据层新增：父子层级 / 共享字段 / 聚合 ----
     session_id: str = ""
     parent_run_id: str = ""
     parent_tool_event_index: int = -1
@@ -98,6 +110,16 @@ class TaskState:
             "status": str(data.get("status", STATUS_RUNNING)),
             "tool_steps": int(data.get("tool_steps", 0)),
             "attempts": int(data.get("attempts", 0)),
+            "initial_step_limit": int(data.get("initial_step_limit", 0)),
+            "soft_step_limit": int(data.get("soft_step_limit", 0)),
+            "hard_step_limit": int(data.get("hard_step_limit", 0)),
+            "budget_extensions": int(data.get("budget_extensions", 0)),
+            "recent_progress_score": int(data.get("recent_progress_score", 0)),
+            "no_progress_count": int(data.get("no_progress_count", 0)),
+            "progress_reasons": list(data.get("progress_reasons") or []),
+            "semantic_repeat_count": int(data.get("semantic_repeat_count", 0)),
+            "last_semantic_reason": str(data.get("last_semantic_reason", "")),
+            "last_semantic_signature": str(data.get("last_semantic_signature", "")),
             "last_tool": str(data.get("last_tool", "")),
             "stop_reason": str(data.get("stop_reason", "")),
             "final_answer": str(data.get("final_answer", "")),
@@ -144,6 +166,9 @@ class TaskState:
     def stop_retry_limit(self, final_answer=""):
         return self.stop(STOP_REASON_RETRY_LIMIT_REACHED, final_answer=final_answer)
 
+    def stop_no_progress(self, final_answer=""):
+        return self.stop(STOP_REASON_NO_PROGRESS_DETECTED, final_answer=final_answer)
+
     def stop_model_error(self, final_answer=""):
         return self.stop(STOP_REASON_MODEL_ERROR, status=STATUS_FAILED, final_answer=final_answer)
 
@@ -166,6 +191,16 @@ class TaskState:
             "status": self.status,
             "tool_steps": self.tool_steps,
             "attempts": self.attempts,
+            "initial_step_limit": self.initial_step_limit,
+            "soft_step_limit": self.soft_step_limit,
+            "hard_step_limit": self.hard_step_limit,
+            "budget_extensions": self.budget_extensions,
+            "recent_progress_score": self.recent_progress_score,
+            "no_progress_count": self.no_progress_count,
+            "progress_reasons": list(self.progress_reasons),
+            "semantic_repeat_count": self.semantic_repeat_count,
+            "last_semantic_reason": self.last_semantic_reason,
+            "last_semantic_signature": self.last_semantic_signature,
             "last_tool": self.last_tool,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
