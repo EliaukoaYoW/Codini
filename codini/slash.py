@@ -2,15 +2,14 @@
 交互式命令行提示符工具，支持自适应单线边框下拉列表与多级联想补全
 """
 import os
-import sys
 import shutil
+import sys
 import time
 
 def get_key_win():
     import ctypes
     from ctypes import wintypes
     import msvcrt
-    import time
 
     kernel32 = ctypes.windll.kernel32
     h_stdin = kernel32.GetStdHandle(-10)
@@ -64,10 +63,14 @@ def get_key_win():
     if not is_pipe and ch in ('\x00', '\xe0'):
         # 仅在非管道模式下解析 getwch 方向键前导码
         ch2 = read_char()
-        if ch2 == 'H': return 'up'
-        if ch2 == 'P': return 'down'
-        if ch2 == 'K': return 'left'
-        if ch2 == 'M': return 'right'
+        if ch2 == 'H':
+            return 'up'
+        if ch2 == 'P':
+            return 'down'
+        if ch2 == 'K':
+            return 'left'
+        if ch2 == 'M':
+            return 'right'
         return None
 
     if ch == '\x1b':
@@ -82,17 +85,26 @@ def get_key_win():
                     time.sleep(0.01)
                 if chars_available():
                     ch3 = read_char()
-                    if ch3 == 'A': return 'up'
-                    if ch3 == 'B': return 'down'
-                    if ch3 == 'C': return 'right'
-                    if ch3 == 'D': return 'left'
+                    if ch3 == 'A':
+                        return 'up'
+                    if ch3 == 'B':
+                        return 'down'
+                    if ch3 == 'C':
+                        return 'right'
+                    if ch3 == 'D':
+                        return 'left'
         return 'escape'
 
-    if ch in ('\r', '\n'): return 'enter'
-    if ch == '\t': return 'tab'
-    if ch in ('\b', '\x7f'): return 'backspace'
-    if ch == '\x03': raise KeyboardInterrupt
-    if ch in ('\x04', '\x1a'): raise EOFError
+    if ch in ('\r', '\n'):
+        return 'enter'
+    if ch == '\t':
+        return 'tab'
+    if ch in ('\b', '\x7f'):
+        return 'backspace'
+    if ch == '\x03':
+        raise KeyboardInterrupt
+    if ch in ('\x04', '\x1a'):
+        raise EOFError
     return ch
 
 
@@ -135,16 +147,25 @@ def get_key_unix():
                     if r:
                         b3 = os.read(fd, 1)
                         ch3 = b3.decode('utf-8', errors='ignore')
-                        if ch3 == 'A': return 'up'
-                        if ch3 == 'B': return 'down'
-                        if ch3 == 'C': return 'right'
-                        if ch3 == 'D': return 'left'
+                        if ch3 == 'A':
+                            return 'up'
+                        if ch3 == 'B':
+                            return 'down'
+                        if ch3 == 'C':
+                            return 'right'
+                        if ch3 == 'D':
+                            return 'left'
             return 'escape'
-        if ch in ('\r', '\n'): return 'enter'
-        if ch == '\t': return 'tab'
-        if ch in ('\x7f', '\x08'): return 'backspace'
-        if ch == '\x03': raise KeyboardInterrupt
-        if ch == '\x04': raise EOFError
+        if ch in ('\r', '\n'):
+            return 'enter'
+        if ch == '\t':
+            return 'tab'
+        if ch in ('\x7f', '\x08'):
+            return 'backspace'
+        if ch == '\x03':
+            raise KeyboardInterrupt
+        if ch == '\x04':
+            raise EOFError
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -192,13 +213,13 @@ def draw_interface(prompt, current_text, matches, selected_idx, prev_lines_count
         box_width = max_len + 2
 
         # 顶边框
-        write_stdout(f"\n\033[K┌" + "─" * box_width + "┐")
+        write_stdout("\n\033[K┌" + "─" * box_width + "┐")
         lines_printed += 1
         for line_content in formatted_lines:
-            write_stdout(f"\n\033[K│ " + line_content.ljust(box_width - 2) + " │")
+            write_stdout("\n\033[K│ " + line_content.ljust(box_width - 2) + " │")
             lines_printed += 1
         # 底边框
-        write_stdout(f"\n\033[K└" + "─" * box_width + "┘")
+        write_stdout("\n\033[K└" + "─" * box_width + "┘")
         lines_printed += 1
 
         # 将光标移动回输入行末端
@@ -260,16 +281,25 @@ def read_key_raw_unix(fd):
                 if r:
                     b3 = os.read(fd, 1)
                     ch3 = b3.decode('utf-8', errors='ignore')
-                    if ch3 == 'A': return 'up'
-                    if ch3 == 'B': return 'down'
-                    if ch3 == 'C': return 'right'
-                    if ch3 == 'D': return 'left'
+                    if ch3 == 'A':
+                        return 'up'
+                    if ch3 == 'B':
+                        return 'down'
+                    if ch3 == 'C':
+                        return 'right'
+                    if ch3 == 'D':
+                        return 'left'
         return 'escape'
-    if ch in ('\r', '\n'): return 'enter'
-    if ch == '\t': return 'tab'
-    if ch in ('\x7f', '\x08'): return 'backspace'
-    if ch == '\x03': raise KeyboardInterrupt
-    if ch == '\x04': raise EOFError
+    if ch in ('\r', '\n'):
+        return 'enter'
+    if ch == '\t':
+        return 'tab'
+    if ch in ('\x7f', '\x08'):
+        return 'backspace'
+    if ch == '\x03':
+        raise KeyboardInterrupt
+    if ch == '\x04':
+        raise EOFError
     return ch
 
 
