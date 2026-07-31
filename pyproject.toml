@@ -5,8 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codini"
 version = "0.1.0"
-description = "Small local coding agent for Ollama and OpenAI-compatible models"
+description = "Small local coding agent"
 requires-python = ">=3.10"
+license = {file = "LICENSE"}
 dependencies = [
     "dotenv>=0.9.9",
     "rich>=15.0.0",
@@ -21,5 +22,8 @@ dev = [
   "ruff>=0.4.4",
 ]
 
-[tool.setuptools]
-packages = ["codini"]
+[tool.setuptools.packages.find]
+include = ["codini*"]
+
+[tool.setuptools.package-data]
+"codini.viz" = ["templates/*.html"]
