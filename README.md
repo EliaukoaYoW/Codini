@@ -1,12 +1,12 @@
 <div align="center">
 
-# Codini
+
+**Codini：一个小型、可审计、运行现场留在本地的终端编程 Agent。**
+
+让模型在真实代码仓库中检索、修改、执行与复盘，同时把权限边界、上下文、记忆和运行轨迹留在你的掌控之中。
 
 <img src="assets/codini-branding.svg" alt="Codini 魔术师兔子虚拟形象" width="820">
 
-**一个小型、可审计、运行现场留在本地的终端编程 Agent。**
-
-让模型在真实代码仓库中检索、修改、执行与复盘，同时把权限边界、上下文、记忆和运行轨迹留在你的掌控之中。
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-7C3AED)](#项目状态)
@@ -17,8 +17,6 @@
 
 </div>
 
-> [!NOTE]
-> Codini 仍处于 `0.1.0` 早期开发阶段，当前建议使用 uv 从源码安装。CLI 已接通兼容 OpenAI API 格式的 Provider 与 SiliconFlow。
 
 ## Codini 是什么
 
@@ -29,8 +27,8 @@ Codini 是一个运行在终端里的轻量 Coding Agent。它读取当前 Git �
 - **范围可控**：文件操作被限制在当前 workspace 内，阻止 `../` 路径逃逸。
 - **动作可控**：读取与搜索默认安全；写文件、执行 shell 等高风险动作受审批策略约束。
 - **状态可恢复**：会话、任务状态、checkpoint、报告与 trace 都落在仓库本地的 `.codini/` 中。
-- **过程可观察**：实时 viewer 展示模型尝试、工具调用、审批结果、diff、耗时和 token 使用情况。
-- **上下文可解释**：工作区、工作记忆、相关记忆、历史和当前请求分别分配预算，而不是无限堆叠对话。
+- **过程可观察**：实时 Viewer 面板展示模型尝试、工具调用、审批结果、diff、耗时和 token 使用情况。
+- **上下文可解释**：工作区、工作记忆、相关记忆、历史和当前请求动态分配预算，而不是无限堆叠对话。
 
 ## 核心能力
 
@@ -102,7 +100,7 @@ source .venv/bin/activate
 
 ### 2. 配置模型
 
-Codini 会自动读取当前目录附近的 `.env`。下面两种 provider 任选其一。
+Codini 会自动读取当前目录下的 `.env`（需要手动创建）。下面两种 provider 任选其一。
 
 兼容 OpenAI API 格式的 Provider：
 
@@ -314,14 +312,14 @@ codini/
 ├── cli.py                # CLI 装配、交互循环与启动参数
 ├── runtime.py            # Agent 控制循环、审批、checkpoint 与报告
 ├── context_manager.py    # 上下文预算、压缩和相关记忆召回
-├── memory.py             # working / episodic / durable memory
+├── memory.py             # Working / Episodic / Durable memory
 ├── execution_budget.py   # 动态工具步数与无进展检测
 ├── tools.py              # 工具白名单、校验与执行
-├── run_store.py          # task state、trace、report 的持久化
-├── models.py             # 模型 provider 客户端
+├── run_store.py          # Task state、Trace、Report 的持久化
+├── models.py             # 模型 Provider 客户端
 └── trace/
-    ├── trace.py          # span 与 trace 事件
-    └── viewer.py         # 实时本地 viewer
+    ├── trace.py          # Span 与 Trace 事件
+    └── viewer.py         # 实时本地 Viewer
 ```
 
 ## CLI 速查
@@ -373,9 +371,6 @@ python tests/test.py
 
 [提交 Issue](https://github.com/EliaukoaYoW/Codini/issues) · [创建 Pull Request](https://github.com/EliaukoaYoW/Codini/pulls)
 
-## 许可证
-
-本项目采用 [MIT License](LICENSE)。
 
 ## 项目状态
 
@@ -386,6 +381,10 @@ python tests/test.py
 - 许可证：MIT
 
 当前阶段更适合用于个人仓库、受控实验和 runtime 设计验证。接口、工件 schema 与 CLI 参数仍可能变化；升级前请备份需要保留的 `.codini/` 数据。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
 
 ---
 
