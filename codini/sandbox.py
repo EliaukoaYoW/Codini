@@ -6,8 +6,10 @@
 """
 
 import os
+import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -203,10 +205,182 @@ class BubblewrapSandbox(Sandbox):
         return [p for p in candidates if Path(p).exists()]
 
 
+class DockerSandbox(Sandbox):
+    """在一次性 Docker 容器中执行 shell 命令。
+
+    - 工作区读写挂载到容器内的 /workspace
+    - 每条命令使用独立容器，结束后自动删除
+    - 默认关闭网络并限制 CPU、内存和进程数
+    - 不挂载 Docker socket，也不向容器透传宿主机 PATH/HOME
+    """
+
+    _HOST_ONLY_ENV_NAMES = {
+        "HOME",
+        "PATH",
+        "PWD",
+        "SHELL",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+    }
+
+    def __init__(
+        self,
+        workspace_root,
+        allow_network=False,
+        image="python:3.12-slim",
+        memory="2g",
+        cpus=2.0,
+        pids_limit=256,
+        user=None,
+        docker_executable=None,
+    ):
+        self.workspace_root = Path(workspace_root).resolve()
+        if not self.workspace_root.is_dir():
+            raise ValueError(f"docker sandbox workspace does not exist: {self.workspace_root}")
+        self.allow_network = bool(allow_network)
+        self.image = str(image or "").strip()
+        self.memory = str(memory or "").strip()
+        self.cpus = float(cpus)
+        self.pids_limit = int(pids_limit)
+        self.user = str(user or "").strip() or self._default_user()
+        self.docker_executable = str(
+            docker_executable or shutil.which("docker") or ""
+        ).strip()
+
+        if not self.docker_executable:
+            raise RuntimeError(
+                "docker CLI not found. Install Docker Desktop or Docker Engine, "
+                "then ensure 'docker' is available on PATH."
+            )
+        if not self.image:
+            raise ValueError("docker sandbox image must not be empty")
+        if self.image.startswith("-"):
+            raise ValueError("docker sandbox image must not start with '-'")
+        if not self.memory:
+            raise ValueError("docker sandbox memory limit must not be empty")
+        if self.cpus <= 0:
+            raise ValueError("docker sandbox CPU limit must be greater than zero")
+        if self.pids_limit <= 0:
+            raise ValueError("docker sandbox PID limit must be greater than zero")
+
+    @staticmethod
+    def _default_user():
+        if os.name != "nt" and hasattr(os, "getuid") and hasattr(os, "getgid"):
+            return f"{os.getuid()}:{os.getgid()}"
+        return ""
+
+    @property
+    def name(self):
+        return "docker"
+
+    def run_shell(self, command, cwd, timeout, env):
+        container_name = f"codini-sandbox-{uuid.uuid4().hex[:12]}"
+        cmd, process_env = self._build_command(
+            command,
+            cwd,
+            env,
+            container_name=container_name,
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                env=process_env,
+            )
+        except subprocess.TimeoutExpired:
+            self._remove_container(container_name, process_env)
+            return SandboxResult(
+                returncode=-1,
+                stdout="",
+                stderr=f"sandbox: command timed out after {timeout}s",
+            )
+        except BaseException:
+            self._remove_container(container_name, process_env)
+            raise
+        return SandboxResult(
+            returncode=result.returncode,
+            stdout=result.stdout.strip(),
+            stderr=result.stderr.strip(),
+        )
+
+    def _build_command(self, command, cwd, env, container_name):
+        cwd = Path(cwd).resolve()
+        try:
+            relative_cwd = cwd.relative_to(self.workspace_root)
+        except ValueError as exc:
+            raise ValueError(f"docker sandbox cwd escapes workspace: {cwd}") from exc
+        container_cwd = Path("/workspace") / relative_cwd
+
+        args = [
+            self.docker_executable,
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--init",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--memory",
+            self.memory,
+            "--cpus",
+            str(self.cpus),
+            "--pids-limit",
+            str(self.pids_limit),
+            "--mount",
+            f"type=bind,source={self.workspace_root},target=/workspace",
+            "--workdir",
+            container_cwd.as_posix(),
+        ]
+        if not self.allow_network:
+            args.extend(["--network", "none"])
+        if self.user:
+            args.extend(["--user", self.user])
+        args.extend(["--entrypoint", "/bin/sh"])
+
+        process_env = os.environ.copy()
+        for key, value in sorted((env or {}).items()):
+            key = str(key)
+            if (
+                key.upper() in self._HOST_ONLY_ENV_NAMES
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                or value is None
+            ):
+                continue
+            process_env[key] = str(value)
+            args.extend(["--env", key])
+
+        args.extend([self.image, "-c", str(command)])
+        return args, process_env
+
+    def _remove_container(self, container_name, process_env):
+        try:
+            subprocess.run(
+                [self.docker_executable, "rm", "-f", container_name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                env=process_env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def create_sandbox(kind="none", **kwargs):
     """工厂函数：根据类型名创建沙箱实例。"""
     if kind == "none":
         return NoSandbox()
     if kind == "bubblewrap":
         return BubblewrapSandbox(**kwargs)
+    if kind == "docker":
+        return DockerSandbox(**kwargs)
     raise ValueError(f"unknown sandbox type: {kind}")
