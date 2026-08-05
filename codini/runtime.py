@@ -21,7 +21,7 @@ from pathlib import Path
 
 
 from . import memory as memorylib
-from .context_manager import ContextManager
+from .context_manager import ContextManager,render_tool_result_block
 from .execution_budget import DynamicStepBudget
 from .run_store import RunStore
 from .task_state import TaskState
