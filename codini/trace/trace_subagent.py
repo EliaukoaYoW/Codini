@@ -2,9 +2,9 @@ from .hooks import TraceHooks
 
 class SubAgentTrace(TraceHooks):
     """Wrapper to indent sub-agent visual output."""
-    def __init__(self, parent_viz):
+    def __init__(self, parent_trace):
         super().__init__()
-        self.parent = parent_viz
+        self.parent = parent_trace
 
     @property
     def current_depth(self):
@@ -19,9 +19,9 @@ class SubAgentTrace(TraceHooks):
         if self.parent:
             self.parent.on_run_start(user_message)
 
-    def on_thinking_start(self, attempt: int, max_steps: int) -> None:
+    def on_thinking_start(self, attempt: int, max_steps: int, tool_steps: int = 0) -> None:
         if self.parent:
-            self.parent.on_thinking_start(attempt, max_steps)
+            self.parent.on_thinking_start(attempt, max_steps, tool_steps)
 
     def on_thinking_end(self, duration_ms: int) -> None:
         if self.parent:

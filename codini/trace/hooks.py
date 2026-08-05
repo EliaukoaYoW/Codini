@@ -8,7 +8,7 @@ class TraceHooks:
     def on_run_start(self, user_message: str) -> None:
         pass
 
-    def on_thinking_start(self, attempt: int, max_steps: int) -> None:
+    def on_thinking_start(self, attempt: int, max_steps: int, tool_steps: int = 0) -> None:
         pass
 
     def on_thinking_end(self, duration_ms: int) -> None:
@@ -43,7 +43,8 @@ class TraceSpanProcessor(SpanProcessor):
         elif span.name == "llm.complete":
             self.trace.on_thinking_start(
                 span.attributes.get("attempts", 1),
-                span.attributes.get("max_steps", 6)
+                span.attributes.get("max_steps", 6),
+                span.attributes.get("tool_steps", 0),
             )
         elif span.name.startswith("tool."):
             self.trace.on_tool_call(

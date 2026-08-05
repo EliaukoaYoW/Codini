@@ -251,6 +251,7 @@ class FileSpanExporter(SpanProcessor):
             self._write_event("model_parsed", span, {
                 "kind": span.attributes.get("kind"),
                 "raw": span.attributes.get("raw"),
+                "tool_calls": span.attributes.get("tool_calls", []),
                 "span_status": span.attributes.get("span_status", "OK"),
                 "error": error_info,
                 "error_type": error_info.get("error_type", ""),
