@@ -6,7 +6,12 @@ from datetime import datetime
 from pathlib import Path
 
 from codini.evaluator import run_fixed_benchmark
-from codini.models import FakeModelClient, OpenAICompatibleModelClient, SiliconflowModelClient
+from codini.models import (
+    FakeModelClient,
+    OpenAICompatibleModelClient,
+    SiliconflowModelClient,
+    provider_spec,
+)
 from codini.runtime import Codini, SessionStore
 from codini.workspace import WorkspaceContext
 
@@ -761,48 +766,44 @@ def _provider_profile(provider):
     if load_dotenv is not None:
         load_dotenv()
     provider = str(provider).strip().lower()
-    if provider == "openai":
-        env_names = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
-        values = {name: os.environ.get(name, "").strip() for name in env_names}
-        missing = [name for name, value in values.items() if not value]
-        if missing:
-            return {
-                "provider": provider,
-                "status": "blocked",
-                "reason": f"missing required environment variables: {', '.join(missing)}",
-            }
+    try:
+        spec = provider_spec(provider)
+    except ValueError:
         return {
             "provider": provider,
-            "status": "ready",
-            "model": values["OPENAI_MODEL"],
-            "base_url": values["OPENAI_BASE_URL"],
-            "api_key": values["OPENAI_API_KEY"],
+            "status": "blocked",
+            "reason": f"unsupported provider: {provider}",
         }
-    if provider == "siliconflow":
-        env_names = (
-            "SILICONFLOW_API_KEY",
-            "SILICONFLOW_BASE_URL",
-            "SILICONFLOW_MODEL",
+    model = os.environ.get(spec.model_env, "").strip()
+    base_url = next(
+        (os.environ.get(name, "").strip() for name in spec.base_url_envs if os.environ.get(name)),
+        "",
+    )
+    api_key = next(
+        (os.environ.get(name, "").strip() for name in spec.api_key_envs if os.environ.get(name)),
+        "",
+    )
+    missing = [
+        name
+        for name, value in (
+            (spec.model_env, model),
+            (spec.base_url_envs[0], base_url),
+            (spec.api_key_envs[0], api_key),
         )
-        values = {name: os.environ.get(name, "").strip() for name in env_names}
-        missing = [name for name, value in values.items() if not value]
-        if missing:
-            return {
-                "provider": provider,
-                "status": "blocked",
-                "reason": f"missing required environment variables: {', '.join(missing)}",
-            }
+        if not value
+    ]
+    if missing:
         return {
             "provider": provider,
-            "status": "ready",
-            "model": values["SILICONFLOW_MODEL"],
-            "base_url": values["SILICONFLOW_BASE_URL"],
-            "api_key": values["SILICONFLOW_API_KEY"],
+            "status": "blocked",
+            "reason": f"missing required environment variables: {', '.join(missing)}",
         }
     return {
         "provider": provider,
-        "status": "blocked",
-        "reason": f"unsupported provider: {provider}",
+        "status": "ready",
+        "model": model,
+        "base_url": base_url,
+        "api_key": api_key,
     }
 
 def _make_provider_client(provider, timeout=None):
@@ -813,16 +814,8 @@ def _make_provider_client(provider, timeout=None):
         30,
         int(timeout or os.environ.get("CODINI_EXPERIMENT_TIMEOUT", "180")),
     )
-    if profile["provider"] == "openai":
-        return OpenAICompatibleModelClient(
-            model=profile["model"],
-            base_url=profile["base_url"],
-            api_key=profile["api_key"],
-            temperature=0.0,
-            timeout=timeout,
-        )
-
-    return SiliconflowModelClient(
+    client_cls = provider_spec(profile["provider"]).client_cls
+    return client_cls(
         model=profile["model"],
         base_url=profile["base_url"],
         api_key=profile["api_key"],

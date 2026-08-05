@@ -14,7 +14,7 @@ from codini.context_manager import (
     ContextManager,
     section_budgets_for_total,
 )
-from codini.models import OpenAICompatibleModelClient, SiliconflowModelClient
+from codini.models import provider_spec
 from codini.runtime import Codini, SessionStore
 from codini.workspace import WorkspaceContext
 
@@ -240,48 +240,41 @@ def _provider_profile(provider):
     if load_dotenv is not None:
         load_dotenv()
     provider = str(provider).strip().lower()
-    if provider == "openai":
-        env_names = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
-        values = {name: os.environ.get(name, "").strip() for name in env_names}
-        missing = [name for name, value in values.items() if not value]
-        if missing:
-            return {
-                "provider": provider,
-                "status": "blocked",
-                "reason": f"missing required environment variables: {', '.join(missing)}",
-            }
+    try:
+        spec = provider_spec(provider)
+    except ValueError:
         return {
             "provider": provider,
-            "status": "ready",
-            "model": values["OPENAI_MODEL"],
-            "base_url": values["OPENAI_BASE_URL"],
-            "api_key": values["OPENAI_API_KEY"],
+            "status": "blocked",
+            "reason": f"unsupported provider: {provider}",
         }
-    if provider == "siliconflow":
-        env_names = (
-            "SILICONFLOW_API_KEY",
-            "SILICONFLOW_BASE_URL",
-            "SILICONFLOW_MODEL",
-        )
-        values = {name: os.environ.get(name, "").strip() for name in env_names}
-        missing = [name for name, value in values.items() if not value]
-        if missing:
-            return {
-                "provider": provider,
-                "status": "blocked",
-                "reason": f"missing required environment variables: {', '.join(missing)}",
-            }
+    model = os.environ.get(spec.model_env, "").strip()
+    base_url = next(
+        (os.environ.get(name, "").strip() for name in spec.base_url_envs if os.environ.get(name)),
+        "",
+    )
+    api_key = next(
+        (os.environ.get(name, "").strip() for name in spec.api_key_envs if os.environ.get(name)),
+        "",
+    )
+    values = {
+        spec.model_env: model,
+        spec.base_url_envs[0]: base_url,
+        spec.api_key_envs[0]: api_key,
+    }
+    missing = [name for name, value in values.items() if not value]
+    if not missing:
         return {
             "provider": provider,
             "status": "ready",
-            "model": values["SILICONFLOW_MODEL"],
-            "base_url": values["SILICONFLOW_BASE_URL"],
-            "api_key": values["SILICONFLOW_API_KEY"],
+            "model": model,
+            "base_url": base_url,
+            "api_key": api_key,
         }
     return {
         "provider": provider,
         "status": "blocked",
-        "reason": f"unsupported provider: {provider}",
+        "reason": f"missing required environment variables: {', '.join(missing)}",
     }
 
 
@@ -293,16 +286,8 @@ def _make_provider_client(provider, timeout=None):
         30,
         int(timeout or os.environ.get("CODINI_EXPERIMENT_TIMEOUT", "180")),
     )
-    if profile["provider"] == "openai":
-        return OpenAICompatibleModelClient(
-            model=profile["model"],
-            base_url=profile["base_url"],
-            api_key=profile["api_key"],
-            temperature=0.0,
-            timeout=timeout,
-        )
-
-    return SiliconflowModelClient(
+    client_cls = provider_spec(profile["provider"]).client_cls
+    return client_cls(
         model=profile["model"],
         base_url=profile["base_url"],
         api_key=profile["api_key"],
@@ -316,6 +301,30 @@ def _normalize_text(value):
     while text.endswith((".", "!", "?", "\"", "'")):
         text = text[:-1].strip()
     return text
+
+
+def _context_task_succeeded(case, answer):
+    """Verify the answer while accepting equivalent scope wording."""
+    if case.get("source") != "relevant_memory":
+        return _normalize_text(answer) == _normalize_text(case["value"])
+
+    def parts(value):
+        text = str(value).strip().lower().replace("`", "")
+        text = text.splitlines()[0].strip() if text else ""
+        return [item.strip(" .,:;\"'()[]") for item in text.split("|")]
+
+    expected_parts = parts(case["value"])
+    actual_parts = parts(answer)
+    if len(expected_parts) != 3 or len(actual_parts) != 3:
+        return False
+    if actual_parts[:2] != expected_parts[:2]:
+        return False
+    scope = actual_parts[2]
+    return (
+        scope in {"file", "file-scoped", "file scoped"}
+        or "/" in scope
+        or "\\" in scope
+    )
 
 
 def _write_json_artifact(path, payload):
@@ -1213,10 +1222,10 @@ def run_memory_mechanism_ablation_v3(
     return _write_json_artifact(artifact_path, payload)
 
 
-# 对照实验二: 同一预算下的上下文动态分配
+# 实验二: 同一预算下的上下文动态分配
 CONTEXT_ALLOCATION_SOURCES = ("prefix", "memory", "relevant_memory", "history")
 CONTEXT_ALLOCATION_PRESSURES = (("moderate", 1.25), ("high", 1.50), ("extreme", 1.80))
-CONTEXT_ALLOCATION_VARIANTS = ("fixed", "dynamic", "full_context")
+CONTEXT_ALLOCATION_VARIANTS = ("fixed", "dynamic")
 CONTEXT_EVIDENCE_OFFSETS = (-180, 60, 140)
 
 
@@ -1256,6 +1265,11 @@ def _context_history(target_chars, evidence="", evidence_offset=0):
         return [
             {
                 "role": "user",
+                "content": _context_noise("history_old", newest_first),
+            },
+            {"role": "assistant", "content": _context_noise("history_recent_a", newest_second)},
+            {
+                "role": "user",
                 "content": _context_payload(
                     "history_evidence",
                     evidence_chars,
@@ -1263,8 +1277,6 @@ def _context_history(target_chars, evidence="", evidence_offset=0):
                     evidence_ratio,
                 ),
             },
-            {"role": "assistant", "content": _context_noise("history_recent_a", newest_first)},
-            {"role": "user", "content": _context_noise("history_recent_b", newest_second)},
         ]
 
     entries = []
@@ -1315,6 +1327,87 @@ class _ContextAllocationAgent:
         return ""
 
 
+def _context_task_spec(source, pressure_name):
+    """Build a source-specific multi-fact task for the allocation experiment."""
+    pressure_index = {"moderate": 0, "high": 1, "extreme": 2}[pressure_name]
+    if source == "prefix":
+        profiles = (
+            ("blue", "manual", "45", "enabled"),
+            ("canary", "dual-review", "30", "enabled"),
+            ("emergency", "owner-only", "15", "required"),
+        )
+        track, approval, window, rollback = profiles[pressure_index]
+        facts = (
+            f"Policy anchor: release track={track}.",
+            f"Policy fact: approval mode={approval}.",
+            f"Policy fact: deployment window={window} minutes.",
+            f"Policy fact: rollback gate={rollback}.",
+        )
+        return {
+            "facts": facts,
+            "value": f"{track}|{approval}|{window}|{rollback}",
+            "instruction": "Return track|approval|window_minutes|rollback_gate.",
+        }
+    if source == "memory":
+        profiles = (
+            ("eu-north-1", "3", "warm", "team-kite", "v4"),
+            ("us-west-2", "5", "cold", "team-orbit", "v5"),
+            ("ap-south-1", "7", "warming", "team-pulse", "v6"),
+        )
+        region, replicas, cache, owner, version = profiles[pressure_index]
+        facts = (
+            f"Working-state anchor: region={region}.",
+            f"Working-state fact: replicas={replicas}.",
+            f"Working-state fact: cache={cache}.",
+            f"Working-state fact: owner={owner}.",
+            f"Working-state fact: release={version}.",
+        )
+        return {
+            "facts": facts,
+            "value": f"{region}|{replicas}|{cache}|{owner}|{version}",
+            "instruction": "Return region|replicas|cache|owner|release.",
+        }
+    if source == "relevant_memory":
+        profiles = (
+            (5, 2, 8),
+            (6, 3, 12),
+            (8, 4, 20),
+        )
+        project_retry, file_retry, backoff = profiles[pressure_index]
+        facts = (
+            "Applicable file: services/payments.cfg.",
+            f"Project default: retry limit={project_retry}.",
+            f"File-scoped override: retry limit={file_retry}.",
+            f"File-scoped backoff={backoff} seconds.",
+            "Scope rule: an applicable file override wins over the project default.",
+        )
+        return {
+            "facts": facts,
+            "value": f"{file_retry}|{backoff}|file",
+            "instruction": "Apply the file scope and return retry_limit|backoff_seconds|scope.",
+        }
+    if source == "history":
+        profiles = (
+            (120, 35, -10),
+            (180, 45, -15),
+            (240, 60, -25),
+        )
+        initial, increase, correction = profiles[pressure_index]
+        final_value = initial + increase + correction
+        facts = (
+            f"History anchor: initial quota={initial}.",
+            f"History update: quota increase=+{increase}.",
+            f"History correction: incident adjustment={correction}.",
+            "History rule: apply updates in chronological order.",
+        )
+        return {
+            "facts": facts,
+            "value": f"{final_value}|{increase + correction}",
+            "instruction": "Apply the history updates and return final_quota|net_change.",
+        }
+    raise ValueError(f"unsupported context allocation source: {source}")
+
+
 def _context_allocation_case(
     source,
     pressure_name,
@@ -1324,8 +1417,10 @@ def _context_allocation_case(
 ):
     section_budgets = section_budgets_for_total(total_budget)
     key = f"ALLOC-{source.upper()}-{pressure_name.upper()}"
-    value = f"VALUE-{source.upper()}-{pressure_name.upper()}-7319"
-    evidence = f"The value for allocation key {key} is {value}."
+    task_spec = _context_task_spec(source, pressure_name)
+    answer_facts = task_spec["facts"]
+    evidence = answer_facts[0]
+    evidence_block = "\n".join(answer_facts)
     target_chars = {
         section: max(200, int(section_budgets[section] * float(pressure_ratio)))
         for section in CONTEXT_ALLOCATION_SOURCES
@@ -1333,7 +1428,7 @@ def _context_allocation_case(
     if source != "relevant_memory":
         target_chars["history"] += target_chars["relevant_memory"]
     evidence_at = min(
-        target_chars[source] - len(evidence),
+        target_chars[source] - len(evidence_block),
         section_budgets[source] + 20 + int(evidence_offset),
     )
     evidence_ratio = evidence_at / target_chars[source]
@@ -1341,25 +1436,25 @@ def _context_allocation_case(
     prefix = _context_payload(
         "prefix",
         target_chars["prefix"],
-        evidence if source == "prefix" else "",
+        evidence_block if source == "prefix" else "",
         evidence_ratio,
     )
     memory_text = _context_payload(
         "memory",
         target_chars["memory"],
-        evidence if source == "memory" else "",
+        evidence_block if source == "memory" else "",
         evidence_ratio,
     )
     history = _context_history(
         target_chars["history"],
-        evidence if source == "history" else "",
+        evidence_block if source == "history" else "",
         evidence_offset=evidence_offset,
     )
     notes = []
     if source == "relevant_memory":
         per_note_chars = max(200, target_chars["relevant_memory"] // 3)
         per_note_evidence_at = min(
-            per_note_chars - len(evidence),
+            per_note_chars - len(evidence_block),
             (section_budgets["relevant_memory"] // 3) + 20 + int(evidence_offset),
         )
         per_note_evidence_ratio = per_note_evidence_at / per_note_chars
@@ -1369,7 +1464,7 @@ def _context_allocation_case(
                     "text": _context_payload(
                         f"relevant_{index}",
                         per_note_chars,
-                        evidence if index == 0 else "",
+                        evidence_block if index == 0 else "",
                         per_note_evidence_ratio,
                     ),
                     "note_type": "constraint" if index == 0 else "observation",
@@ -1379,12 +1474,17 @@ def _context_allocation_case(
             )
 
     prompts = {
-        "prefix": f"According to the project rule, return the value for allocation key {key}.",
-        "memory": f"Use the working memory for this code task and return the value for allocation key {key}.",
-        "relevant_memory": f"Use the relevant remembered note and return the value for allocation key {key}.",
-        "history": f"Continue the earlier allocation task and return the value for allocation key {key}.",
+        "prefix": f"According to the project policy, solve allocation task {key}.",
+        "memory": f"Use the working state to solve allocation task {key}.",
+        "relevant_memory": f"Use the applicable remembered note to solve allocation task {key}.",
+        "history": f"Use the chronological record to solve allocation task {key}.",
     }
-    request = prompts[source] + " Return the value only, without explanation."
+    request = (
+        prompts[source]
+        + " Combine all required facts, follow the source-specific rule, and "
+        + task_spec["instruction"]
+        + " Return the result only, without explanation."
+    )
     return {
         "id": f"{source}-{pressure_name}",
         "source": source,
@@ -1392,8 +1492,9 @@ def _context_allocation_case(
         "pressure_ratio": float(pressure_ratio),
         "evidence_offset": int(evidence_offset),
         "key": key,
-        "value": value,
+        "value": task_spec["value"],
         "evidence": evidence,
+        "answer_facts": answer_facts,
         "request": request,
         "section_budgets": section_budgets,
         "agent": _ContextAllocationAgent(
@@ -1422,10 +1523,7 @@ def build_context_allocation_prompt(
         evidence_offset=int(evidence_offset),
     )
     agent = case["agent"]
-    if variant == "full_context":
-        agent.feature_flags["context_reduction"] = False
-        strategy = "dynamic"
-    elif variant in {"fixed", "dynamic"}:
+    if variant in {"fixed", "dynamic"}:
         strategy = variant
     else:
         raise ValueError(f"unsupported context allocation variant: {variant}")
@@ -1540,7 +1638,7 @@ def run_real_context_experiment(
                             "repetition": repetition + 1,
                             "evidence_offset": evidence_offset,
                             "variant": variant,
-                            "task_succeeded": _normalize_text(answer) == _normalize_text(case["value"]),
+                            "task_succeeded": _context_task_succeeded(case, answer),
                             "provider_error": provider_error,
                             "evidence_retained": evidence_retained,
                             "misallocated": bool(not evidence_retained and irrelevant_surplus > 0),
@@ -1607,6 +1705,10 @@ def run_real_context_experiment(
         "model": profile["model"],
         "request_timeout": int(request_timeout),
         "total_budget": total_budget,
+        "metric_definitions": {
+            "evidence_retention": "critical anchor fact substring retained in assembled prompt",
+            "task_success": "source-aware semantic verification after combining all source-specific facts",
+        },
         "section_budget_ratios": dict(DEFAULT_SECTION_BUDGET_RATIOS),
         "section_budgets": section_budgets_for_total(total_budget),
         "config_count": len(configs),
@@ -1638,7 +1740,7 @@ def run_real_context_experiment(
 
 def run_context_allocation_ablation_v3(
     artifact_path=DEFAULT_CONTEXT_ALLOCATION_V3_PATH,
-    provider="openai",
+    provider="stepfun",
     repetitions=3,
     total_budget=DEFAULT_TOTAL_BUDGET,
     request_timeout=180,

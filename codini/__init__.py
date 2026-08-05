@@ -1,8 +1,19 @@
-from .cli import build_agent, build_arg_parser, build_welcome, main
-from .models import FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient,SiliconflowModelClient
+from .models import (
+    FakeModelClient,
+    ModelErrorKind,
+    ModelProviderError,
+    ModelRequest,
+    ModelResponse,
+    ModelToolCall,
+    OllamaModelClient,
+    OpenAICompatibleModelClient,
+    SiliconflowModelClient,
+)
 from .runtime import MiniAgent, Codini, SessionStore
 from .run_store import RunStore
 from .workspace import WorkspaceContext
+
+_CLI_EXPORTS = {"build_agent", "build_arg_parser", "build_welcome", "main"}
 
 def __getattr__(name):
     if name in _CLI_EXPORTS:
@@ -22,6 +33,12 @@ __all__ = [
     "OllamaModelClient",
     "OpenAICompatibleModelClient",
     "SiliconflowModelClient",
+    "ModelRequest",
+    "ModelResponse",
+    "ModelToolCall",
+    "ModelErrorKind",
+    "ModelProviderError",
     "SessionStore",
     "WorkspaceContext",
 ]
+

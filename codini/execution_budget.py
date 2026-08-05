@@ -129,8 +129,11 @@ class DynamicStepBudget:
             score = 3
             reasons.append("workspace_changed")
         elif meta.get("child_run_id") or meta.get("child_trace_id"):
-            score = 2
-            reasons.append("new_subagent_result")
+            if result_is_new:
+                score = 2
+                reasons.append("new_subagent_result")
+            else:
+                reasons.append("repeated_subagent_result")
         elif status in {"error", "rejected", "partial_success"}:
             error_key = self._fingerprint(
                 "|".join(

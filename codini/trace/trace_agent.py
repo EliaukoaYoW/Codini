@@ -235,7 +235,7 @@ class RichTrace(TraceHooks):
         if self.current_depth <= 0:
             self.console.print()
 
-    def on_thinking_start(self, attempt: int, max_steps: int) -> None:
+    def on_thinking_start(self, attempt: int, max_steps: int, tool_steps: int = 0) -> None:
         self._attempt = attempt
         self._max_steps = max_steps
         spinner = self._next_spinner()
@@ -243,7 +243,7 @@ class RichTrace(TraceHooks):
         agent_name = "Sub-agent" if self.current_depth > 0 else "Codini"
         self.console.print(
             f"{indent}{spinner}  [dim italic]{agent_name} thinking …[/]  "
-            f"[dim](step {attempt}/{max_steps})[/]"
+            f"[dim](turn {attempt} · tools {tool_steps}/{max_steps})[/]"
         )
 
     def on_thinking_end(self, duration_ms: int) -> None:
@@ -284,8 +284,9 @@ class RichTrace(TraceHooks):
             err_lines = result_text.strip().split("\n")[:3]
             err_prefix = self._err_indent()
             for line in err_lines:
-                clipped = line[:80]
-                self.console.print(f"{err_prefix}[red dim]{clipped}[/]")
+                error_line = Text(err_prefix)
+                error_line.append(line, style="red dim")
+                self.console.print(error_line, overflow="fold")
 
     def on_response_correction(self, attempt: int) -> None:
         self._corrections += 1
@@ -439,11 +440,14 @@ class PlainTrace(TraceHooks):
         if self.current_depth <= 0:
             print()
 
-    def on_thinking_start(self, attempt: int, max_steps: int) -> None:
+    def on_thinking_start(self, attempt: int, max_steps: int, tool_steps: int = 0) -> None:
         self._attempt = attempt
         indent = self._indent(2)
         agent_name = "Sub-agent" if self.current_depth > 0 else "Codini"
-        print(f"{indent}~ {agent_name} thinking ...  (step {attempt}/{max_steps})")
+        print(
+            f"{indent}~ {agent_name} thinking ...  "
+            f"(turn {attempt} · tools {tool_steps}/{max_steps})"
+        )
 
     def on_thinking_end(self, duration_ms: int) -> None:
         indent = self._indent(6)
@@ -466,7 +470,7 @@ class PlainTrace(TraceHooks):
         if not ok:
             err_prefix = self._err_indent()
             for line in result_text.strip().split("\n")[:3]:
-                print(f"{err_prefix}{line[:80]}")
+                print(f"{err_prefix}{line}")
 
     def on_response_correction(self, attempt: int) -> None:
         self._corrections += 1

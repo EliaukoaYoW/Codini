@@ -10,17 +10,13 @@ import textwrap
 import threading
 
 from dotenv import load_dotenv
-from .models import OpenAICompatibleModelClient, SiliconflowModelClient
+from .models import ModelTarget, configured_model_names, create_model_client, provider_names,provider_spec
+
 from .runtime import Codini, SessionStore
 from .sandbox import create_sandbox
 from .workspace import WorkspaceContext, middle
 
-from .branding import (
-    WELCOME_STATUS,
-    cli_panel_width,
-    render_mascot_plain_rows,
-    render_mascot_rich_text,
-)
+from .branding import WELCOME_STATUS, cli_panel_width, render_mascot_plain_rows, render_mascot_rich_text
 
 from .trace import make_trace
 
@@ -42,9 +38,12 @@ load_dotenv()
 DEFAULT_SECRET_ENV_NAMES = (
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
+    "DEEPSEEK_API_KEY",
+    "LONGCAT_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "RIGHT_CODES_API_KEY",
+    "STEPFUN_API_KEY",
     "SILICONFLOW_API_KEY",
     "GITHUB_PAT",
     "GH_PAT"
@@ -61,6 +60,7 @@ HELP_DETAILS = textwrap.dedent(
     /clear   Create a new empty session.
     /compact Compact older session history.
     /context Show prompt context usage.
+    /model   Show or switch to a model configured in the environment.
     /memory  Show the agent's distilled working memory.
     /reset   Clear the current session history and memory.
     /skill   List all available skills or read a specific skill.
@@ -72,6 +72,7 @@ HELP_DETAILS = textwrap.dedent(
 
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "Codini_SECRET_ENV_NAMES"
+DEFAULT_PROVIDER = "stepfun"
 
 COMMANDS_HELP = {
     "/help": "Show this help message.",
@@ -84,17 +85,46 @@ COMMANDS_HELP = {
     "/exit": "Exit the agent."
 }
 
-COMMON_MODELS = [
-    "deepseek-ai/DeepSeek-R1",
-    "deepseek-ai/DeepSeek-V3.2",
-    "deepseek-ai/DeepSeek-V4-Flash",
-    "gpt-5.5",
-    "gpt-5.4",
-    "Qwen/Qwen3.7-Plus",
-    "MiniMaxAI/MiniMax-M2.5",
-    "moonshotai/Kimi-K2.7-Code",
-    "zai-org/GLM-5.2",
-]
+def _provider_model_names(provider):
+    """读取单个 Provider 在环境变量中声明的默认模型和可切换模型。"""
+    spec = provider_spec(provider)
+    try:
+        return configured_model_names(
+            os.environ.get(spec.model_env),
+            os.environ.get(spec.models_env),
+        )
+    except ValueError as exc:
+        raise ValueError(f"Provider '{provider}' 模型配置无效：{exc}") from exc
+
+def _configured_model_targets():
+    """返回环境变量中声明的全部可切换模型，并保留其 Provider 归属。"""
+    return tuple(
+        ModelTarget(provider=provider, model=model)
+        for provider in provider_names()
+        for model in _provider_model_names(provider)
+    )
+
+def _resolve_model_target(model_name):
+    """按模型名解析唯一目标；同名或未配置时给出明确错误。"""
+    model_name = str(model_name or "").strip()
+    if not model_name:
+        raise ValueError("模型名不能为空。")
+    matches = [
+        target
+        for target in _configured_model_targets()
+        if target.model == model_name
+    ]
+    if not matches:
+        raise ValueError(
+            f"模型 '{model_name}' 未在任何 *_MODEL 或 *_MODELS 环境变量中配置。"
+        )
+    if len(matches) > 1:
+        providers = ", ".join(target.provider for target in matches)
+        raise ValueError(
+            f"模型 '{model_name}' 同时存在于多个 Provider：{providers}；"
+            "请调整环境变量，确保可切换模型名唯一。"
+        )
+    return matches[0]
 
 def _required_config(value, provider, env_name, cli_option=None):
     """功能：读取必需配置并在缺失时给出明确提示；输入：候选值、Provider、环境变量名和可选 CLI 参数；输出：非空配置字符串。"""
@@ -107,23 +137,18 @@ def _required_config(value, provider, env_name, cli_option=None):
         f"{alternatives}。"
     )
 
-
-def _effective_model(args, provider="openai"):
+def _effective_model(args, provider=DEFAULT_PROVIDER):
     """功能：解析 Provider 使用的模型名；输入：CLI 参数和 Provider 名称；输出：命令行或环境变量中的模型名。"""
     explicit_model = getattr(args, "model", None)
     if explicit_model:
         return str(explicit_model).strip()
-    env_name = {
-        "openai": "OPENAI_MODEL",
-        "siliconflow": "SILICONFLOW_MODEL",
-    }.get(provider)
-    if env_name is None:
-        raise ValueError(f"不支持的 Provider：{provider}")
-    return _required_config(
-        os.environ.get(env_name),
-        provider,
-        env_name,
-        "--model MODEL",
+    models = _provider_model_names(provider)
+    if models:
+        return models[0]
+    spec = provider_spec(provider)
+    raise ValueError(
+        f"Provider '{provider}' 缺少模型配置：请设置环境变量 "
+        f"{spec.model_env} 或 {spec.models_env}，或传入 --model MODEL。"
     )
 
 def _first_env(*names):
@@ -147,50 +172,34 @@ def _configured_secret_names(args):
         )
     return sorted(configured_secret_names)
 
-def _build_model_client(args):
+def _build_model_client(args, provider=None, model=None, allow_base_url_override=True):
     """功能：根据 CLI 与环境变量创建模型客户端；输入：解析后的 CLI 参数；输出：已完成配置的模型客户端。"""
-    provider = getattr(args, "provider", "openai")
-    if provider == "openai":
-        model = _effective_model(args, provider)
-        base_url = _required_config(
-            getattr(args, "base_url", None) or os.environ.get("OPENAI_BASE_URL"),
-            provider,
-            "OPENAI_BASE_URL",
-            "--base-url URL",
-        )
+    provider = provider or getattr(args, "provider", None) or DEFAULT_PROVIDER
+    spec = provider_spec(provider)
+    model = str(model or "").strip() or _effective_model(args, provider)
+    base_url_override = getattr(args, "base_url", None) if allow_base_url_override else None
+    base_url = _required_config(
+        base_url_override or _first_env(*spec.base_url_envs),
+        provider,
+        spec.base_url_envs[0],
+        "--base-url URL",
+    )
+    if spec.api_key_required:
         api_key = _required_config(
-            _first_env("OPENAI_API_KEY"),
+            _first_env(*spec.api_key_envs),
             provider,
-            "OPENAI_API_KEY",
+            spec.api_key_envs[0],
         )
-        return OpenAICompatibleModelClient(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=args.temperature,
-            timeout=args.openai_timeout,
-        )
-    if provider == "siliconflow":
-        model = _effective_model(args, provider)
-        base_url = _required_config(
-            getattr(args, "base_url", None) or os.environ.get("SILICONFLOW_BASE_URL"),
-            provider,
-            "SILICONFLOW_BASE_URL",
-            "--base-url URL",
-        )
-        api_key = _required_config(
-            _first_env("SILICONFLOW_API_KEY"),
-            provider,
-            "SILICONFLOW_API_KEY",
-        )
-        return SiliconflowModelClient(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=args.temperature,
-            timeout=args.siliconflow_timeout,
-        )
-    raise ValueError(f"不支持的 Provider：{provider}")
+    else:
+        api_key = _first_env(*spec.api_key_envs)
+    return create_model_client(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=args.temperature,
+        timeout=getattr(args, "timeout", 300),
+    )
 
 def build_welcome(agent, model, host, trace_url=None):
     width = cli_panel_width(shutil.get_terminal_size((80, 20)).columns)
@@ -389,15 +398,59 @@ def build_agent(args, trace=None):
     configured_secret_names = _configured_secret_names(args)
     workspace = WorkspaceContext.build(args.cwd)
     store = SessionStore(workspace.repo_root + "/.codini/sessions")
-    model = _build_model_client(args)
-    sandbox = create_sandbox(
-        kind=args.sandbox,
-        workspace_root=args.cwd,
-        allow_network=args.sandbox_network,
-    )
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
+
+    saved_target = None
+    if session_id:
+        session_payload = store.load(session_id)
+        saved_model_target = session_payload.get("model_target", {})
+        if isinstance(saved_model_target, dict):
+            saved_provider = str(saved_model_target.get("provider", "")).strip()
+            saved_model = str(saved_model_target.get("model", "")).strip()
+            if saved_provider and saved_model:
+                provider_spec(saved_provider)
+                if saved_model not in _provider_model_names(saved_provider):
+                    raise ValueError(
+                        f"会话保存的模型 '{saved_model}' 已不在 Provider "
+                        f"'{saved_provider}' 的环境模型配置中。"
+                    )
+                saved_target = ModelTarget(saved_provider, saved_model)
+
+    requested_provider = getattr(args, "provider", None)
+    requested_model = getattr(args, "model", None)
+    if saved_target and not requested_provider and not requested_model:
+        startup_target = saved_target
+    else:
+        startup_provider = requested_provider or (
+            saved_target.provider if saved_target and requested_model else DEFAULT_PROVIDER
+        )
+        startup_model = str(requested_model or "").strip() or _effective_model(
+            args, startup_provider
+        )
+        startup_target = ModelTarget(startup_provider, startup_model)
+
+    model = _build_model_client(
+        args,
+        provider=startup_target.provider,
+        model=startup_target.model,
+    )
+    sandbox_options = {
+        "workspace_root": args.cwd,
+        "allow_network": args.sandbox_network,
+    }
+    if args.sandbox == "docker":
+        sandbox_options.update(
+            {
+                "image": args.docker_image,
+                "memory": args.docker_memory,
+                "cpus": args.docker_cpus,
+                "pids_limit": args.docker_pids_limit,
+                "user": args.docker_user,
+            }
+        )
+    sandbox = create_sandbox(kind=args.sandbox, **sandbox_options)
     if session_id:
         return Codini.from_session(
             model_client = model,
@@ -447,30 +500,23 @@ def build_arg_parser():
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--provider", choices=("openai", "siliconflow"), default="openai", help="Model backend to use.")
-    parser.add_argument("--model", default=None, help="Model name override. Defaults to OPENAI_MODEL or SILICONFLOW_MODEL.")
+    parser.add_argument("--provider", choices=provider_names(), default=None, help=f"Model backend to use. Defaults to {DEFAULT_PROVIDER} for a new session.")
+    parser.add_argument("--model", default=None, help="Model name override. Defaults to *_MODEL, then the first entry in *_MODELS.")
     parser.add_argument("--base-url", default=None, help="Provider API base URL override.")
-    parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
-    parser.add_argument("--siliconflow-timeout", type=int, default=300, help="SiliconFlow request timeout in seconds.")
+    parser.add_argument("--timeout", type=int, default=300, help="Request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
-    parser.add_argument(
-        "--secret-env-name",
-        dest="secret_env_names",
-        action="append",
-        default=[],
-        help="Extra environment variable names to treat as secrets for trace/report redaction.",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=6,
-        help="Initial tool-step budget per request; successful progress can extend it to an internal hard limit.",
-    )
+    parser.add_argument("--secret-env-name",dest="secret_env_names",action="append",default=[],help="Extra environment variable names to treat as secrets for trace/report redaction.",)
+    parser.add_argument("--max-steps",type=int,default=6,help="Initial tool-step budget per request; successful progress can extend it to an internal hard limit.",)
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to the model provider.")
-    parser.add_argument("--sandbox", choices=("none", "bubblewrap"), default="none", help="Sandbox backend for shell execution (default: none).")
-    parser.add_argument("--sandbox-network", action="store_true", default=False, help="Allow network access inside bubblewrap sandbox.")
+    parser.add_argument("--sandbox", choices=("none", "bubblewrap", "docker"), default="none", help="Sandbox backend for shell execution (default: none).")
+    parser.add_argument("--sandbox-network", action="store_true", default=False, help="Allow network access inside bubblewrap or Docker sandbox.")
+    parser.add_argument("--docker-image", default=os.environ.get("CODINI_DOCKER_IMAGE", "python:3.12-slim"), help="Docker image used by --sandbox docker.")
+    parser.add_argument("--docker-memory", default=os.environ.get("CODINI_DOCKER_MEMORY", "2g"), help="Docker container memory limit.")
+    parser.add_argument("--docker-cpus", type=float, default=float(os.environ.get("CODINI_DOCKER_CPUS", "2")), help="Docker container CPU limit.")
+    parser.add_argument("--docker-pids-limit", type=int, default=int(os.environ.get("CODINI_DOCKER_PIDS_LIMIT", "256")), help="Docker container process limit.")
+    parser.add_argument("--docker-user", default=os.environ.get("CODINI_DOCKER_USER"), help="Optional Docker container user or uid:gid override.")
     parser.add_argument("--no-trace-live", action="store_false", dest="trace_live", default=True, help="Disable starting a live trace viewer for this session.")
     parser.add_argument("--trace-host", default="127.0.0.1", help="Host for --trace-live.")
     parser.add_argument("--trace-port", type=int, default=8765, help="Port for --trace-live.")
@@ -549,7 +595,7 @@ def main(argv = None):
                 user_input = interactive_prompt(
                     prompt_text="\n\033[1;35mCodini\033[0m \033[1;33m>\033[0m ",
                     commands_help=COMMANDS_HELP,
-                    common_models=COMMON_MODELS,
+                    common_models=[target.model for target in _configured_model_targets()],
                     history=history,
                     skills=skills
                 ).strip()
@@ -587,11 +633,40 @@ def main(argv = None):
         if user_input.startswith("/model"):
             parts = user_input.split(maxsplit=1)
             if len(parts) == 2:
-                new_model = agent.switch_model(parts[1])
-                print(f"switched to {new_model}")
+                try:
+                    target = _resolve_model_target(parts[1])
+                    current_provider = str(getattr(agent.model_client, "provider", ""))
+                    current_model = str(getattr(agent.model_client, "model", ""))
+                    if target.provider == current_provider and target.model == current_model:
+                        print(f"already using {target.model} ({target.provider})")
+                        continue
+                    new_client = _build_model_client(args,provider=target.provider,model=target.model,allow_base_url_override=False,)
+                    new_model = agent.switch_model(new_client)
+                    print(f"switched to {new_model} ({target.provider})")
+                except (ValueError, RuntimeError) as exc:
+                    print(str(exc), file=sys.stderr)
             else:
                 current = getattr(agent.model_client, "model", "")
-                print(f"current model: {current}")
+                current_provider = getattr(agent.model_client, "provider", "")
+                print(f"current model: {current} ({current_provider})")
+                print("available models:")
+                targets = _configured_model_targets()
+                if not targets:
+                    print("  (none configured)")
+                model_counts = {}
+                for target in targets:
+                    model_counts[target.model] = model_counts.get(target.model, 0) + 1
+                for target in targets:
+                    marker = (
+                        "*"
+                        if target.model == current
+                        and target.provider == current_provider
+                        else "!" if model_counts[target.model] > 1 else " "
+                    )
+                    print(f"  {marker} {target.model} ({target.provider})")
+                if any(count > 1 for count in model_counts.values()):
+                    print("  ! duplicate model name; switching requires a unique name")
+                print("switch with: /model <name>")
             continue
         if user_input == "/reset":
             agent.reset()
