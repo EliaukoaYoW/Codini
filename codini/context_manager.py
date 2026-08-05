@@ -21,6 +21,15 @@ DEFAULT_SECTION_BUDGET_RATIOS = {
 }
 
 
+def render_tool_result_block(tool_name: str, content: Any) -> str:
+    """Render one provider-neutral tool result block for transcript context."""
+    name = str(tool_name or "unknown").strip() or "unknown"
+    body = str(content or "")
+    if name == "delegate":
+        body = f"<delegate_result>\n{body}\n</delegate_result>"
+    return f'<tool_result name="{name}">\n{body}\n</tool_result>'
+
+
 def section_budgets_for_total(total_budget: int) -> dict[str, int]:
     """Scale the shared section proportions to a concrete total budget."""
     total_budget = max(0, int(total_budget))
@@ -41,9 +50,10 @@ DEFAULT_SECTION_FLOORS = {
     "relevant_memory": 800,
     "history": 3000
 }
-
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix") # 当 Prompt 超预算时的压缩顺序
-SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request") # 拼接 Prompt 时各 Section 的排列顺序（从上到下）
+# 当 Prompt 超预算时的压缩顺序
+DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
+# 拼接 Prompt 时各 Section 的排列顺序（从上到下）
+SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request")
 CURRENT_REQUEST_SECTION = "current_request"  # 当前用户的请求环节
 RELEVANT_MEMORY_LIMIT = 3                    # 最多召回 3 条相关历史笔记
 DEFAULT_SECTION_WEIGHTS = {
@@ -817,7 +827,7 @@ class ContextManager:
         for item in history:
             if item["role"] == "tool":
                 lines.append(f"[assistant]: <tool>{{\"name\":\"{item['name']}\",\"args\":{json.dumps(item['args'], sort_keys=True)}}}</tool>")
-                lines.append(f"[system]: <tool_result>:\n{item['content']}\n<tool_result>")
+                lines.append(f"[system]: {render_tool_result_block(item['name'], item['content'])}")
             else:
                 lines.append(f"[{item['role']}] {item['content']}")
         return "\n".join(["Transcript:", *lines])
@@ -831,7 +841,10 @@ class ContextManager:
         """
         if item["role"] == "tool":
             prefix = f"[assistant] <tool>{{\"name\":\"{item['name']}\",\"args\":{json.dumps(item['args'], sort_keys=True)}}}</tool>"
-            content = f"[system] Tool result:\n{_tail_clip(item['content'], max(20, line_limit))}"
+            content = "[system] " + render_tool_result_block(
+                item["name"],
+                _tail_clip(item["content"], max(20, line_limit)),
+            )
             return [prefix, content]
         
         content = item.get("content", "")

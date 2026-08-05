@@ -26,6 +26,7 @@ from .execution_budget import DynamicStepBudget
 from .run_store import RunStore
 from .task_state import TaskState
 from .sandbox import NoSandbox
+from .models import ModelResponse, ModelProviderError
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 from .trace import Tracer, TraceSpanProcessor, FileSpanExporter, Span
@@ -192,6 +193,7 @@ class Codini:
             "memory": memorylib.default_memory_state(),
         }
         self._ensure_session_shape()
+        self.session["model_target"] = self.current_model_target()
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root = self.root
@@ -215,6 +217,7 @@ class Codini:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self._response_corrections = []
         self._unresolved_tool_failures = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
@@ -227,8 +230,8 @@ class Codini:
             "read_only": bool(self.read_only),
             "sandbox": getattr(self.sandbox, "name", "none") or "none",
             "model": getattr(model_client, "model", "") or "",
-            "provider": model_client.__class__.__name__,
-            "session_id": (session or {}).get("id", "") if session else "",
+            "provider": getattr(model_client, "provider", "") or model_client.__class__.__name__,
+            "session_id": self.session.get("id", ""),
         }
         self.tracer = Tracer()
         if self.trace:
@@ -265,11 +268,22 @@ class Codini:
         if not isinstance(resume_state, dict):
             self.session["resume_state"] = {}
 
+    def current_model_target(self):
+        """返回不含凭据的当前模型身份，用于 session、trace 和恢复。"""
+        return {
+            "provider": str(
+                getattr(self.model_client, "provider", "")
+                or self.model_client.__class__.__name__
+            ),
+            "model": str(getattr(self.model_client, "model", "")),
+        }
+    
     def current_runtime_identity(self):
         """ 返回当前运行时的”身份“快照 用在 checkpoint 中检测环境是否发生变化"""
         return {
             "session_id": self.session.get("id", ""),
             "cwd": str(self.root),
+            "provider": self.current_model_target()["provider"],
             "model": str(getattr(self.model_client, "model", "")),
             "model_client": self.model_client.__class__.__name__,
             "approval_policy": self.approval_policy,
@@ -330,6 +344,7 @@ class Codini:
                 current_identity = self.current_runtime_identity()
                 identity_keys = (
                     "cwd",
+                    "provider",
                     "model",
                     "model_client",
                     "approval_policy",
@@ -416,10 +431,39 @@ class Codini:
     def build_tools(self):
         return toolkit.build_tool_registry(self)
 
+    def model_tool_definitions(self):
+        """把 Codini 工具注册表转换成 Provider 无关的函数工具描述。"""
+        type_names = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
+        definitions = []
+        for name, tool in self.tools.items():
+            properties = {}
+            required = []
+            for field_name, rule in tool.get("schema", {}).items():
+                rule_text = str(rule)
+                type_name = rule_text.split("=", 1)[0].strip()
+                properties[field_name] = {"type": type_names.get(type_name, "string")}
+                if "=" not in rule_text:
+                    required.append(field_name)
+            parameters = {"type": "object", "properties": properties}
+            if required:
+                parameters["required"] = required
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool.get("description", ""),
+                        "parameters": parameters,
+                    },
+                }
+            )
+        return tuple(definitions)
+
     def _sandbox_notes(self):
         notes = {
             "none": "The workspace directory is writable. You can read and write files directly.",
             "bubblewrap": "The workspace directory is mounted into the sandbox. Files you create or modify in the sandbox are visible on the host. System directories like /usr and /etc are read-only. Network access is blocked by default.",
+            "docker": "Shell commands run in a disposable Docker container. The workspace is mounted read-write at /workspace, while the rest of the container is ephemeral. Network access is blocked by default and the container has bounded CPU, memory, and process count.",
         }
         return notes.get(self.sandbox.name, "")
 
@@ -437,7 +481,6 @@ class Codini:
                 }
             )
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
 
     def build_prefix(self):
         """
@@ -532,7 +575,6 @@ class Codini:
         self.prefix_state = prefix_state
         self.prefix = prefix_state.text
 
-
     def refresh_prefix(self, force = False):
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
         previous_workspace_fingerprint = getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", None)
@@ -557,7 +599,6 @@ class Codini:
     def memory_text(self):
         return self.memory.render_memory_text()
 
-
     def history_text(self):
         history = self.session["history"]
         if not history:
@@ -577,7 +618,7 @@ class Codini:
             if item["role"] == "tool":
                 limit = 10000 if recent else 180
                 lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(clip(item["content"], limit))
+                lines.append(render_tool_result_block(item["name"], clip(item["content"], limit)))
             else:
                 limit = 10000 if recent else 220
                 if item.get("role") == "assistant" and item.get("status") == "failed":
@@ -615,6 +656,8 @@ class Codini:
         self.session_path = self.session_store.save(self.session)
 
     def build_error_info(self, error, stop_reason=""):
+        if isinstance(error, ModelProviderError):
+            return error.to_dict()
         message = str(error)
         payload = _extract_error_payload(message)
         http_match = re.search(r"\bHTTP\s+(\d{3})\b", message, re.I)
@@ -837,19 +880,36 @@ class Codini:
 
     def _complete_with_heartbeat(self, prompt, prompt_cache_key, prompt_cache_retention):
         try:
-            raw = self.model_client.complete(
-                prompt,
-                self.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
-            )
+            if hasattr(self.model_client, "complete_response"):
+                response = self.model_client.complete_response(
+                    prompt,
+                    self.max_new_tokens,
+                    prompt_cache_key=prompt_cache_key,
+                    prompt_cache_retention=prompt_cache_retention,
+                    tools=self.model_tool_definitions(),
+                )
+            else:
+                response = self.model_client.complete(
+                    prompt,
+                    self.max_new_tokens,
+                    prompt_cache_key=prompt_cache_key,
+                    prompt_cache_retention=prompt_cache_retention,
+                )
+            if not isinstance(response, ModelResponse):
+                response = ModelResponse.from_legacy(
+                    response,
+                    getattr(self.model_client, "last_completion_metadata", {}),
+                    provider=getattr(self.model_client, "provider", ""),
+                )
         except Exception as e:
+            if isinstance(e, ModelProviderError):
+                raise
             err_msg = str(e)
             if "read operation timed out" in err_msg or "timeout" in err_msg.lower():
                 err_msg = f"LLM API request timed out (network read operation timed out). The model provider is likely overloaded: {e}"
             raise RuntimeError(err_msg) from e
-        return raw
-
+        return response
+    
     def _accum_model(self, completion_metadata, duration_ms=0):
         """把后端的 usage / cache 字段累加到当前 run 的累加器。"""
         accum = getattr(self, "_run_accum", None)
@@ -900,7 +960,10 @@ class Codini:
         # 兜底：如果累加器没被初始化（比如某些异常路径），回退到扫 history。
         if not tools:
             for item in self.session["history"]:
-                if item.get("role") != "tool":
+                if (
+                    item.get("role") != "tool"
+                    or item.get("status") == "rejected"
+                ):
                     continue
                 name = item.get("name") or ""
                 tools[name] = tools.get(name, 0) + 1
@@ -925,6 +988,8 @@ class Codini:
             },
             "status": task_state.status,
             "stop_reason": task_state.stop_reason,
+            "response_correction_count": len(self._response_corrections),
+            "response_corrections": list(self._response_corrections[-10:]),
         }
         task_state.summary = summary
         self.session.setdefault("_run_summaries", {})[task_state.run_id] = summary
@@ -1268,6 +1333,33 @@ class Codini:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
+    def record_response_correction(
+        self,
+        *,
+        attempt,
+        error_type,
+        message,
+        signature,
+        repeat_count,
+        raw="",
+        tool_name="",
+        args=None,
+    ):
+        """功能：记录模型响应校正证据；输入：分类、原文和调用信息；输出：诊断字典。"""
+        diagnostic = {
+            "attempt": int(attempt or 0),
+            "error_type": str(error_type or "response_error"),
+            "message": clip(str(message or ""), 1200),
+            "signature": str(signature or ""),
+            "repeat_count": int(repeat_count or 0),
+            "raw": clip(str(raw or ""), 2000),
+            "tool_name": str(tool_name or ""),
+            "args": dict(args or {}),
+        }
+        self._response_corrections.append(diagnostic)
+        self._response_corrections = self._response_corrections[-20:]
+        return diagnostic
+
     def capture_user_typed_note(self, user_message):
         if not self.feature_enabled("memory"):
             return None
@@ -1304,6 +1396,7 @@ class Codini:
         """
         run_started_at = time.monotonic()
         self._trace_started_at = run_started_at
+        self._response_corrections = []
         self.memory.set_task_summary(user_message)
         self.capture_user_typed_note(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
@@ -1385,6 +1478,11 @@ class Codini:
         tool_steps = 0
         attempts = 0
         max_attempts = max(step_budget.initial_limit * 3, step_budget.initial_limit + 4)
+        last_invalid_response_signature = ""
+        repeated_invalid_response_count = 0
+        last_invalid_response_error = ""
+        response_retry_limit_reached = False
+        invalid_tool_repeat_reached = False
         pending_error = None
 
         try:
@@ -1457,9 +1555,7 @@ class Codini:
                 prompt_started_at = time.monotonic()
                 prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
                 redacted_prompt = self.redact_artifact(prompt)
-                redacted_prompt_without_current_request = self.redact_artifact(
-                    prompt_metadata.get("prompt_without_current_request", "")
-                )
+                redacted_prompt_without_current_request = self.redact_artifact(prompt_metadata.get("prompt_without_current_request", ""))
                 prompt_metadata_for_trace = dict(prompt_metadata)
                 prompt_metadata_for_trace.pop("prompt_without_current_request", None)
                 run_span.add_event(
@@ -1552,10 +1648,14 @@ class Codini:
 
                 with self.tracer.span_scope("llm.complete", llm_attrs) as llm_span:
                     model_started_at = time.monotonic()
-                    raw = self._complete_with_heartbeat(prompt, prompt_cache_key, prompt_cache_retention)
+                    response = self._complete_with_heartbeat(prompt, prompt_cache_key, prompt_cache_retention)
                     model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
 
-                    completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
+                    completion_metadata = dict(response.to_metadata())
+                    completion_metadata.update(
+                        getattr(self.model_client, "last_completion_metadata", {}) or {}
+                    )
+                    raw = response.trace_text()
                     if completion_metadata:
                         for key, value in completion_metadata.items():
                             if value is not None:
@@ -1570,18 +1670,165 @@ class Codini:
                     }
                     model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
                     self._accum_model(completion_metadata, duration_ms=model_duration_ms)
-                    kind, payload = self.parse(raw)
+                    kind, payload = self.parse_model_response(response)
 
                     llm_span.set_attributes({
                         "kind": kind,
                         "raw": clip(raw, 600),
+                        "tool_calls": [call.to_dict() for call in response.tool_calls],
                         **_extract_run_usage_fields(completion_metadata),
                     })
                 if kind == "tool":
-                    tool_steps += 1
                     name = payload.get("name", "")
                     args = payload.get("args", {})
-                    task_state.record_tool(name)
+                    schema_error = ""
+                    try:
+                        self.validate_tool_schema(name, args)
+                    except toolkit.ToolValidationError as exc:
+                        schema_error = str(exc)
+                    if schema_error:
+                        problem = f"invalid tool arguments for {name}: {schema_error}"
+                        example = toolkit.tool_example(name)
+                        if example:
+                            problem += f". Example: {example}"
+                        invalid_signature = hashlib.sha256(
+                            json.dumps(
+                                {
+                                    "kind": "tool",
+                                    "name": name,
+                                    "args": args,
+                                    "error_type": "schema_error",
+                                    "validation_error": schema_error,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        if invalid_signature == last_invalid_response_signature:
+                            repeated_invalid_response_count += 1
+                        else:
+                            last_invalid_response_signature = invalid_signature
+                            repeated_invalid_response_count = 1
+                        last_invalid_response_error = problem
+                        correction = self.retry_notice(problem)
+                        diagnostic = self.record_response_correction(
+                            attempt=attempts,
+                            error_type="schema_error",
+                            message=problem,
+                            signature=invalid_signature,
+                            repeat_count=repeated_invalid_response_count,
+                            raw=raw,
+                            tool_name=name,
+                            args=args,
+                        )
+                        self.record(
+                            {
+                                "role": "system",
+                                "content": correction,
+                                "created_at": now(),
+                            }
+                        )
+                        self.run_store.write_task_state(
+                            task_state,
+                            trigger="response_correction",
+                            related_span_id=run_span.span_id,
+                            related_event="response_correction",
+                        )
+                        run_span.add_event(
+                            "response_correction",
+                            {
+                                "attempt": attempts,
+                                "tool_name": name,
+                                "error_type": "schema_error",
+                                "validation_error": schema_error,
+                                "invalid_response_signature": invalid_signature,
+                                "repeated_invalid_response_count": repeated_invalid_response_count,
+                                "diagnostic": diagnostic,
+                            },
+                        )
+                        if repeated_invalid_response_count >= 3:
+                            response_retry_limit_reached = True
+                            break
+                        continue
+
+                    state_error = ""
+                    state_error_type = ""
+                    try:
+                        self.validate_tool_state(name, args)
+                    except toolkit.ToolValidationError as exc:
+                        state_error = str(exc)
+                        state_error_type = exc.error_type
+                    if state_error:
+                        problem = f"{name} request rejected: {state_error}"
+                        invalid_signature = hashlib.sha256(
+                            json.dumps(
+                                {
+                                    "kind": "tool",
+                                    "name": name,
+                                    "args": args,
+                                    "error_type": state_error_type,
+                                    "validation_error": state_error,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        if invalid_signature == last_invalid_response_signature:
+                            repeated_invalid_response_count += 1
+                        else:
+                            last_invalid_response_signature = invalid_signature
+                            repeated_invalid_response_count = 1
+                        last_invalid_response_error = problem
+                        diagnostic = self.record_response_correction(
+                            attempt=attempts,
+                            error_type=state_error_type,
+                            message=problem,
+                            signature=invalid_signature,
+                            repeat_count=repeated_invalid_response_count,
+                            raw=raw,
+                            tool_name=name,
+                            args=args,
+                        )
+                        self.record(
+                            {
+                                "role": "tool",
+                                "name": name,
+                                "args": args,
+                                "content": f"error: {problem}",
+                                "status": "rejected",
+                                "error_type": state_error_type,
+                                "created_at": now(),
+                            }
+                        )
+                        self.run_store.write_task_state(
+                            task_state,
+                            trigger="tool_rejected",
+                            related_span_id=run_span.span_id,
+                            related_event="tool_rejected",
+                        )
+                        run_span.add_event(
+                            "tool_rejected",
+                            {
+                                "attempt": attempts,
+                                "tool_name": name,
+                                "args": args,
+                                "error_type": state_error_type,
+                                "validation_error": state_error,
+                                "invalid_response_signature": invalid_signature,
+                                "repeated_invalid_response_count": repeated_invalid_response_count,
+                                "diagnostic": diagnostic,
+                            },
+                        )
+                        if repeated_invalid_response_count >= 3:
+                            invalid_tool_repeat_reached = True
+                            break
+                        continue
+
+                    last_invalid_response_signature = ""
+                    repeated_invalid_response_count = 0
+                    last_invalid_response_error = ""
                     risky = bool(self.tools.get(name, {}).get("risky", False))
 
                     tool_attrs = {
@@ -1635,11 +1882,15 @@ class Codini:
                                 result = self.run_tool(name, args)
                             finally:
                                 self.current_tool_span_id = ""
-                        tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
 
+                        tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
                         tool_status = (self._last_tool_result_metadata or {}).get("tool_status", "ok")
                         success = tool_status not in ("error", "rejected", "partial_success")
                         tool_result_meta = dict(self._last_tool_result_metadata or {})
+                        tool_executed = tool_status != "rejected"
+                        if tool_executed:
+                            tool_steps += 1
+                            task_state.record_tool(name)
                         observation = step_budget.observe(name, args, result, tool_result_meta)
                         task_state.recent_progress_score = step_budget.recent_progress_score
                         task_state.no_progress_count = observation.no_progress_count
@@ -1667,7 +1918,8 @@ class Codini:
                                 },
                             )
 
-                        self._accum_tool(name, duration_ms=tool_duration_ms)
+                        if tool_executed:
+                            self._accum_tool(name, duration_ms=tool_duration_ms)
                         self.record(
                             {
                                 "role": "tool",
@@ -1741,14 +1993,62 @@ class Codini:
                     continue
 
                 if kind == "retry":
-                    self.record({"role": "assistant", "content": payload, "created_at": now()})
+                    correction_payload = dict(payload or {})
+                    invalid_signature = str(correction_payload.get("signature", ""))
+                    error_type = str(
+                        correction_payload.get("error_type", "format_error")
+                    )
+                    problem = str(
+                        correction_payload.get("problem", "invalid model response")
+                    )
+                    correction = str(
+                        correction_payload.get("message") or self.retry_notice(problem)
+                    )
+                    if invalid_signature == last_invalid_response_signature:
+                        repeated_invalid_response_count += 1
+                    else:
+                        last_invalid_response_signature = invalid_signature
+                        repeated_invalid_response_count = 1
+                    last_invalid_response_error = problem
+                    diagnostic = self.record_response_correction(
+                        attempt=attempts,
+                        error_type=error_type,
+                        message=problem,
+                        signature=invalid_signature,
+                        repeat_count=repeated_invalid_response_count,
+                        raw=correction_payload.get("raw", raw),
+                        tool_name=str(
+                            (correction_payload.get("parsed") or {}).get("name", "")
+                        ),
+                        args=(correction_payload.get("parsed") or {}).get("args", {}),
+                    )
+                    self.record(
+                        {
+                            "role": "system",
+                            "content": correction,
+                            "created_at": now(),
+                        }
+                    )
                     self.run_store.write_task_state(
                         task_state,
                         trigger="response_correction",
                         related_span_id=run_span.span_id,
                         related_event="response_correction",
                     )
-                    run_span.add_event("response_correction", {"attempt": attempts})
+                    run_span.add_event(
+                        "response_correction",
+                        {
+                            "attempt": attempts,
+                            "error_type": error_type,
+                            "invalid_response_signature": invalid_signature,
+                            "repeated_invalid_response_count": repeated_invalid_response_count,
+                            "validation_error": problem,
+                            "diagnostic": diagnostic,
+                        },
+                    )
+                    if repeated_invalid_response_count >= 3:
+                        response_retry_limit_reached = True
+                        break
                     continue
                 final = (payload or raw).strip()
                 self.record({"role": "assistant", "content": final, "created_at": now()})
@@ -1756,11 +2056,10 @@ class Codini:
                 self.promote_durable_memory(user_message, final)
 
                 tools_viz = []
-                tool_count = task_state.tool_steps
-                for item in self.session["history"][-(tool_count + 1):]:
-                    if item.get("role") == "tool":
+                for tool_name, count in self._run_accum["tools"].items():
+                    for _ in range(count):
                         tools_viz.append({
-                            "name": item.get("name", ""),
+                            "name": tool_name,
                             "success": True,
                             "summary": "",
                             "duration_ms": 0,
@@ -1827,9 +2126,26 @@ class Codini:
                     "Resume with a different investigation strategy."
                 )
                 task_state.stop_no_progress(final)
-            elif attempts >= max_attempts:
-                final = "Stopped after too many malformed model responses without a valid tool call or final answer."
+            elif invalid_tool_repeat_reached:
+                final = (
+                    "Stopped after the same rejected tool request was repeated "
+                    f"{repeated_invalid_response_count} times. "
+                    f"Last tool rejection: {last_invalid_response_error}"
+                )
+                task_state.stop_invalid_tool_repeat(final)
+            elif response_retry_limit_reached:
+                final = (
+                    "Stopped after the same malformed model response was repeated "
+                    f"{repeated_invalid_response_count} times. "
+                    f"Last response error: {last_invalid_response_error}"
+                )
                 task_state.stop_retry_limit(final)
+            elif attempts >= max_attempts:
+                final = (
+                    "Stopped after reaching the model-attempt safety limit "
+                    "without a final answer."
+                )
+                task_state.stop_attempt_limit(final)
             else:
                 final = "Stopped after reaching the step limit without a final answer."
                 task_state.stop_step_limit(final)
@@ -2143,6 +2459,7 @@ class Codini:
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "error": dict(getattr(task_state, "error", {}) or {}),
+            "response_corrections": list(self._response_corrections[-10:]),
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
@@ -2152,12 +2469,22 @@ class Codini:
     def tool_example(self, name):
         return toolkit.tool_example(name)
 
+    def validate_tool_schema(self, name, args):
+        """功能：校验工具是否可用及参数结构；输入：工具名和参数；输出：无。"""
+        if name not in self.tools:
+            raise toolkit.ToolSchemaError(f"unknown or unavailable tool: {name}")
+        toolkit.validate_tool_schema(name, args)
+
+    def validate_tool_state(self, name, args):
+        """功能：校验工具请求所需的工作区状态；输入：工具名和参数；输出：无。"""
+        toolkit.validate_tool_state(self, name, args)
+        if name == "delegate" and self.depth >= self.max_depth:
+            raise toolkit.ToolPolicyError("delegate depth exceeded")
+
     def validate_tool(self, name, args):
         """ 把通用工具校验和 runtime 级额外约束串起来。 """
-        toolkit.validate_tool(self, name, args)
-        if name == "delegate":
-            if self.depth >= self.max_depth:
-                raise ValueError("delegate depth exceeded")
+        self.validate_tool_schema(name, args)
+        self.validate_tool_state(name, args)
 
     def tool_list_files(self, args):
         return toolkit.tool_list_files(self, args)
@@ -2219,36 +2546,156 @@ class Codini:
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Codini.retry_notice("model returned malformed tool JSON")
-            if not isinstance(payload, dict):
-                return "retry", Codini.retry_notice("tool payload must be a JSON object")
-            if not str(payload.get("name", "")).strip():
-                return "retry", Codini.retry_notice("tool payload is missing a tool name")
-            args = payload.get("args", {})
-            if args is None:
-                payload["args"] = {}
-            elif not isinstance(args, dict):
-                return "retry", Codini.retry_notice()
-            return "tool", payload
-        if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
+                return "retry", Codini.response_correction(
+                    "format_error",
+                    "model returned malformed tool JSON",
+                    raw=raw,
+                )
+            return Codini.parsed_tool_result(payload, raw=raw)
+        if "<tool" in raw and "<tool_result" not in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Codini.parse_xml_tool(raw)
             if payload is not None:
-                return "tool", payload
-            return "retry", Codini.retry_notice()
-        if "<longcat_tool_call>" in raw and ("<final>" not in raw or raw.find("<longcat_tool_call>") < raw.find("<final>")):
-            payload = Codini.parse_longcat_tool_call(raw)
-            if payload is not None:
-                return "tool", payload
-            return "retry", Codini.retry_notice("model returned malformed LongCat tool call")
+                return Codini.parsed_tool_result(payload, raw=raw)
+            return "retry", Codini.response_correction(
+                "format_error",
+                "model returned malformed XML tool output",
+                raw=raw,
+            )
         if "<final>" in raw:
             final = Codini.extract(raw, "final").strip()
             if final:
                 return "final", final
-            return "retry", Codini.retry_notice("model returned an empty <final> answer")
+            return "retry", Codini.response_correction(
+                "format_error",
+                "model returned an empty <final> answer",
+                raw=raw,
+            )
         raw = raw.strip()
         if raw:
             return "final", raw
-        return "retry", Codini.retry_notice("model returned an empty response")
+        return "retry", Codini.response_correction(
+            "format_error",
+            "model returned an empty response",
+            raw=raw,
+        )
+
+    @staticmethod
+    def parse_model_response(response):
+        """消费 Provider 归一化的响应；原始文本仅作为兼容 fallback。"""
+        if not isinstance(response, ModelResponse):
+            return Codini.parse(response)
+        if response.tool_calls:
+            if len(response.tool_calls) > 1:
+                return "retry", Codini.response_correction(
+                    "tool_format",
+                    "model returned multiple tool calls; return one tool call at a time",
+                    raw=response.trace_text(),
+                )
+            call = response.tool_calls[0]
+            return Codini.parsed_tool_result(
+                {"name": call.name, "args": call.arguments_dict()},
+                raw=response.trace_text(),
+            )
+        return Codini.parse(response.assistant_text)
+
+    @staticmethod
+    def parsed_tool_result(payload, raw=""):
+        """功能：统一校验三种工具协议；输入：解析后的工具载荷；输出：tool 或 retry 决策。"""
+        if not isinstance(payload, dict):
+            return "retry", Codini.response_correction(
+                "schema_error",
+                "tool payload must be a JSON object",
+                raw=raw,
+            )
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            return "retry", Codini.response_correction(
+                "schema_error",
+                "tool payload is missing a tool name",
+                raw=raw,
+                parsed=payload,
+            )
+        spec = toolkit.BASE_TOOL_SPECS.get(name)
+        if spec is None:
+            return "retry", Codini.response_correction(
+                "schema_error",
+                f"unknown tool: {name}",
+                raw=raw,
+                parsed=payload,
+            )
+        args = payload.get("args", {})
+        if args is None:
+            args = {}
+            payload["args"] = args
+        elif not isinstance(args, dict):
+            return "retry", Codini.response_correction(
+                "schema_error",
+                "tool args must be a JSON object",
+                raw=raw,
+                parsed=payload,
+            )
+
+        schema = spec.get("schema", {})
+        required_fields = [
+            field for field, rule in schema.items() if "=" not in str(rule)
+        ]
+        missing_fields = [
+            field
+            for field in required_fields
+            if field not in args
+            or args[field] is None
+            or (isinstance(args[field], str) and not args[field].strip())
+        ]
+        if missing_fields:
+            misplaced_fields = [
+                field for field in missing_fields if field in payload
+            ]
+            if misplaced_fields:
+                problem = (
+                    "tool arguments must be nested inside args; misplaced: "
+                    + ", ".join(misplaced_fields)
+                )
+            else:
+                problem = (
+                    f"tool call for {name} is missing required args: "
+                    + ", ".join(missing_fields)
+                )
+            example = toolkit.tool_example(name)
+            if example:
+                problem += f". Example: {example}"
+            return "retry", Codini.response_correction(
+                "schema_error",
+                problem,
+                raw=raw,
+                parsed={"name": name, "args": args},
+            )
+        return "tool", {"name": name, "args": args}
+
+    @staticmethod
+    def response_correction(error_type, problem, raw="", parsed=None):
+        """功能：构造可审计的响应校正；输入：错误分类、原因和原文；输出：诊断字典。"""
+        normalized = {
+            "error_type": str(error_type or "response_error"),
+            "problem": str(problem or "model returned malformed output"),
+            "parsed": dict(parsed or {}),
+        }
+        signature_source = normalized
+        if normalized["error_type"] == "format_error":
+            signature_source = {
+                "error_type": normalized["error_type"],
+                "raw": str(raw or "").strip(),
+            }
+        normalized["signature"] = hashlib.sha256(
+            json.dumps(
+                signature_source,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        normalized["raw"] = clip(str(raw or ""), 2000)
+        normalized["message"] = Codini.retry_notice(normalized["problem"])
+        return normalized
 
     @staticmethod
     def retry_notice(problem=None):
@@ -2265,10 +2712,15 @@ class Codini:
 
     @staticmethod
     def parse_xml_tool(raw):
-        """ 解析 XML 属性风格的工具调用 """
+        """功能：解析 XML 属性及参数正文；输入：模型原文；输出：工具名和参数。"""
         match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.S)
         if not match:
-            return None
+            self_closing = re.search(r"<tool(?P<attrs>[^>]*)/>", raw, re.S)
+            if not self_closing:
+                return None
+            attrs = Codini.parse_attrs(self_closing.group("attrs"))
+            name = str(attrs.pop("name", "")).strip()
+            return {"name": name, "args": attrs} if name else None
         attrs = Codini.parse_attrs(match.group("attrs"))
         name = str(attrs.pop("name", "")).strip()
         if not name:
@@ -2276,36 +2728,48 @@ class Codini:
 
         body = match.group("body")
         args = dict(attrs)
+        for container_name in ("args", "arguments"):
+            if f"<{container_name}>" not in body:
+                continue
+            encoded_args = Codini.extract_raw(body, container_name).strip()
+            try:
+                decoded_args = json.loads(encoded_args)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(decoded_args, dict):
+                return None
+            nested_args = decoded_args.get("args")
+            args.update(
+                nested_args if isinstance(nested_args, dict) else decoded_args
+            )
+
         for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
             if f"<{key}>" in body:
                 args[key] = Codini.extract_raw(body, key)
 
         body_text = body.strip("\n")
-        if name == "write_file" and "content" not in args and body_text:
+        decoded_body = None
+        if body_text and body_text.lstrip().startswith("{"):
+            try:
+                decoded_body = json.loads(body_text)
+            except json.JSONDecodeError:
+                decoded_body = None
+            if isinstance(decoded_body, dict):
+                nested_args = decoded_body.get("args")
+                args.update(
+                    nested_args if isinstance(nested_args, dict) else decoded_body
+                )
+        if (
+            name == "write_file"
+            and "content" not in args
+            and body_text
+            and decoded_body is None
+            and "<args>" not in body
+            and "<arguments>" not in body
+        ):
             args["content"] = body_text
         if name == "delegate" and "task" not in args and body_text:
             args["task"] = body_text.strip()
-        return {"name": name, "args": args}
-
-    @staticmethod
-    def parse_longcat_tool_call(raw):
-        # TODO: remove this experimental LongCat compatibility once provider output is normalized upstream.
-        match = re.search(r"<longcat_tool_call>(?P<body>.*?)(?:</longcat_tool_call>|$)", str(raw), re.S)
-        if not match:
-            return None
-        body = match.group("body").strip()
-        body = re.sub(r"/\s*$", "", body).strip()
-        call_match = re.match(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>.*)\)\s*$", body, re.S)
-        if call_match:
-            name = call_match.group("name")
-            args_text = call_match.group("args")
-        else:
-            attr_match = re.match(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<args>.*)$", body, re.S)
-            if not attr_match:
-                return None
-            name = attr_match.group("name")
-            args_text = attr_match.group("args")
-        args = Codini.parse_call_args(args_text)
         return {"name": name, "args": args}
 
     @staticmethod
@@ -2376,14 +2840,34 @@ class Codini:
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root = self.root)
         self.session_store.save(self.session)
 
-    def switch_model(self, new_model):
-        """切换当前会话使用的模型名称（同一 provider 内）"""
-        new_model = str(new_model).strip()
-        if not new_model:
-            return getattr(self.model_client, "model", "")
-        self.model_client.model = new_model
-        self.prefix_state = self.build_prefix()
-        self.prefix = self.prefix_state.text
+    def switch_model(self, new_client):
+        """原子替换模型客户端，并持久化不含凭据的模型身份。"""
+        new_model = str(getattr(new_client, "model", "")).strip()
+        new_provider = str(getattr(new_client, "provider", "")).strip()
+        if not new_model or not new_provider:
+            raise ValueError("新的模型客户端必须包含 provider 和 model。")
+
+        old_client = self.model_client
+        old_prefix_state = self.prefix_state
+        old_prefix = self.prefix
+        self.model_client = new_client
+        try:
+            new_prefix_state = self.build_prefix()
+        except Exception:
+            self.model_client = old_client
+            self.prefix_state = old_prefix_state
+            self.prefix = old_prefix
+            raise
+
+        self.prefix_state = new_prefix_state
+        self.prefix = new_prefix_state.text
+        self.session["model_target"] = self.current_model_target()
+        self.session["runtime_identity"] = self.current_runtime_identity()
+        self._run_inherited_seed.update(
+            {"provider": new_provider, "model": new_model}
+        )
+        self.last_completion_metadata = {}
+        self.session_path = self.session_store.save(self.session)
         return new_model
 
     def path(self, raw_path):
