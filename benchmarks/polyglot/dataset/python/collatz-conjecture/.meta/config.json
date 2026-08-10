@@ -1,0 +1,31 @@
+{
+  "authors": [
+    "zwaltman"
+  ],
+  "contributors": [
+    "BethanyG",
+    "cmccandless",
+    "Dog",
+    "ikhadykin",
+    "K4cePhoenix",
+    "N-Parsons",
+    "smt923",
+    "Stigjb",
+    "thomasjpfan",
+    "tqa236"
+  ],
+  "files": {
+    "solution": [
+      "collatz_conjecture.py"
+    ],
+    "test": [
+      "collatz_conjecture_test.py"
+    ],
+    "example": [
+      ".meta/example.py"
+    ]
+  },
+  "blurb": "Calculate the number of steps to reach 1 using the Collatz conjecture.",
+  "source": "Wikipedia",
+  "source_url": "https://en.wikipedia.org/wiki/Collatz_conjecture"
+}

@@ -1,0 +1,106 @@
+# Dunder methods with `__getattribute__`
+
+```python
+OPS = {
+    "plus": "__add__",
+    "minus": "__sub__",
+    "multiplied by": "__mul__",
+    "divided by": "__truediv__"
+}
+
+
+def answer(question):
+    question = question.removeprefix("What is").removesuffix("?").strip()
+    if not question:
+        raise ValueError("syntax error")
+
+    if question.startswith("-") and question[1:].isdigit():
+        return -int(question[1:])
+    if question.isdigit():
+        return int(question)
+
+    found_op = False
+    for name, op in OPS.items():
+        if name in question:
+            question = question.replace(name, op)
+            found_op = True
+    if not found_op:
+        raise ValueError("unknown operation")
+
+    ret = question.split()
+    while len(ret) > 1:
+        try:
+            x, op, y, *tail = ret
+            if op not in OPS.values():
+                raise ValueError("syntax error")
+            ret = [int(x).__getattribute__(op)(int(y)), *tail]
+        except:
+            raise ValueError("syntax error")
+    return ret[0]
+```
+
+This approach begins by defining a [dictionary][dictionaries] of the word keys with their related [dunder method][dunder] values.
+Since only whole numbers are involved, the available dunder methods are those for the [`int`][int] class/namespace.
+The supported methods for the `int()` namespace can be found by using `print(dir(int))` or `print(int.__dict__)` in a Python terminal.
+See [this StackOverflow post][dir-vs-__dict__] for more details.
+
+<br>
+
+~~~~exercism/note
+The built-in [`dir`](https://docs.python.org/3/library/functions.html?#dir) function returns a list of all valid attributes for an object.
+The dunder method [`<object>.__dict__`](https://docs.python.org/3/reference/datamodel.html#object.__dict__) is a mapping of an object's writable attributes.
+~~~~
+
+<br>
+
+The `OPS` dictionary is defined with all uppercase letters, which is the naming convention for a Python [constant][const].
+It indicates that the value should not be changed.
+
+The input question to the `answer()` function is cleaned using the [`removeprefix`][removeprefix], [`removesuffix`][removesuffix], and [`strip`][strip] string methods.
+The method calls are [chained][method-chaining], so the output from one call is the input for the next call.
+If the input has no characters left, it uses the [falsiness][falsiness] of an empty string with the [`not`][not] operator to return a `ValueError("syntax error")`.
+
+Next, the [`str.startswith()`][startswith] and [`str.isdigit()`][isdigit] methods are used to see if the remaining characters in the input are either negative or positive digits.
+Because "-" is used to denote negative numbers, `str.startswith("-")` is used in the first condition and `question[1:].isdigit()` is used for the remaining string.
+If the `str.isdigit()` checks pass, the [`int()` constructor][int-constructor] is used to return the string as an integer with the proper sign.
+
+Next, the elements in the `OPS` dictionary are iterated over.
+If the key name is in the input, the [`str.replace`][replace] method is used to replace the name in the input with the dunder method value.
+If none of the key names are found in the input, a `ValueError("unknown operation")` is raised.
+
+At this point, the input question is [`split()`][split] into a `list` of its words, which is then iterated over while its [`len()`][len] is greater than 1.
+
+Within a [`try-except`][exception-handling] block, the list is [unpacked][unpacking] (_see also [concept:python/unpacking-and-multiple-assignment]()_) into the variables `x`, `op`, `y`, and `*tail`.
+If `op` is not in the `OPS` dictionary, a `ValueError("syntax error")` is raised.
+
+The `except` block will catch this error (or any other error raised inside the `try` block), and `raise` a `ValueError("syntax error")` instead.
+(You can look at [exception chaining in the Python docs][exception-chaining] for further detail on this subject.)
+
+Next, `x` is converted to an `int` and [`__getattribute__`][getattribute] is called for the dunder method (`op`) to apply to `x`.
+`y` is then converted to an `int` and passed as the second argument to `op`.
+
+Then `ret` is redefined to a `list` containing the result of the dunder method plus the remaining elements in `*tail`.
+
+When `ret` reaches `len() == 1` and the loop ends, the first element of `ret` is returned as the answer.
+
+[const]: https://realpython.com/python-constants/
+[dictionaries]: https://docs.python.org/3/tutorial/datastructures.html#dictionaries
+[dir-vs-__dict__]: https://stackoverflow.com/a/14361362
+[dunder]: https://www.tutorialsteacher.com/python/magic-methods-in-python
+[exception-chaining]: https://docs.python.org/3/tutorial/errors.html#exception-chaining
+[exception-handling]: https://docs.python.org/3/tutorial/errors.html#handling-exceptions
+[falsiness]: https://www.pythontutorial.net/python-basics/python-boolean/
+[getattribute]: https://docs.python.org/3/reference/datamodel.html?#object.__getattribute__
+[int-constructor]: https://docs.python.org/3/library/functions.html?#int
+[int]: https://docs.python.org/3/library/stdtypes.html#typesnumeric
+[isdigit]: https://docs.python.org/3/library/stdtypes.html?#str.isdigit
+[len]: https://docs.python.org/3/library/functions.html?#len
+[method-chaining]: https://www.tutorialspoint.com/Explain-Python-class-method-chaining
+[not]: https://docs.python.org/3/library/operator.html?#operator.__not__
+[removeprefix]: https://docs.python.org/3/library/stdtypes.html#str.removeprefix
+[removesuffix]: https://docs.python.org/3/library/stdtypes.html#str.removesuffix
+[replace]: https://docs.python.org/3/library/stdtypes.html?#str.replace
+[split]: https://docs.python.org/3/library/stdtypes.html?#str.split
+[strip]: https://docs.python.org/3/library/stdtypes.html#str.strip
+[startswith]: https://docs.python.org/3/library/stdtypes.html#str.startswith
+[unpacking]: https://treyhunner.com/2018/10/asterisks-in-python-what-they-are-and-how-to-use-them/

@@ -1,0 +1,38 @@
+{
+  "authors": [],
+  "contributors": [
+    "behrtam",
+    "cmccandless",
+    "crazymykl",
+    "Dog",
+    "dotrungkien",
+    "henrik",
+    "ikhadykin",
+    "kytrinyx",
+    "lowks",
+    "markijbema",
+    "N-Parsons",
+    "n1k0",
+    "pheanex",
+    "roadfoodr",
+    "sjakobi",
+    "thomasjpfan",
+    "tqa236",
+    "vgerak",
+    "yawpitch"
+  ],
+  "files": {
+    "solution": [
+      "anagram.py"
+    ],
+    "test": [
+      "anagram_test.py"
+    ],
+    "example": [
+      ".meta/example.py"
+    ]
+  },
+  "blurb": "Find the words that use the same letters as another word.",
+  "source": "Inspired by the Extreme Startup game",
+  "source_url": "https://github.com/rchatley/extreme_startup"
+}
