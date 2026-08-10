@@ -99,68 +99,94 @@ def build_tool_registry(agent):
 def tool_example(name):
     return TOOL_EXAMPLES.get(name,"")
 
-def validate_tool(agent, name, args):
-    args = args or {}
 
-    if name == "list_files":
-        path = agent.path(args.get("path", "."))
-        if not path.is_dir():
-            raise ValueError("path is not a directory")
-        return
+class ToolValidationError(ValueError):
+    """功能：表示工具请求校验失败；输入：错误说明；输出：带分类的 ValueError。"""
+
+    error_type = "tool_validation_error"
+
+
+class ToolSchemaError(ToolValidationError):
+    """功能：表示工具参数结构或取值错误；输入：错误说明；输出：schema_error。"""
+
+    error_type = "schema_error"
+
+
+class ToolStateError(ToolValidationError):
+    """功能：表示参数正确但工作区状态不满足；输入：错误说明；输出：tool_state_error。"""
+
+    error_type = "tool_state_error"
+
+
+class ToolPolicyError(ToolValidationError):
+    """功能：表示工具请求违反运行时边界；输入：错误说明；输出：tool_policy_error。"""
+
+    error_type = "tool_policy_error"
+
+
+def _workspace_path(agent, raw_path):
+    """功能：安全解析工作区路径；输入：Agent 和原始路径；输出：工作区内绝对路径。"""
+    try:
+        return agent.path(raw_path)
+    except ValueError as exc:
+        raise ToolPolicyError(str(exc)) from exc
+
+
+def validate_tool_schema(name, args):
+    """功能：校验工具参数结构和值；输入：工具名和参数；输出：无，失败时抛 ToolSchemaError。"""
+    if not isinstance(args, dict):
+        raise ToolSchemaError("args must be a JSON object")
+    args = args or {}
+    schema = (BASE_TOOL_SPECS.get(name) or {}).get("schema", {})
+    for field, rule in schema.items():
+        if "=" not in str(rule) and field not in args:
+            raise ToolSchemaError(f"missing required argument: {field}")
 
     if name == "read_file":
-        path = agent.path(args["path"])
-        if not path.is_file():
-            raise ValueError("path is not a file")
-        start = int(args.get("start", 1))
-        end = int(args.get("end", 200))
+        try:
+            start = int(args.get("start", 1))
+            end = int(args.get("end", 200))
+        except (TypeError, ValueError) as exc:
+            raise ToolSchemaError("start and end must be integers") from exc
         if start < 1 or end < start:
-            raise ValueError("invalid line range")
+            raise ToolSchemaError("invalid line range")
         return
 
     if name == "search":
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
-            raise ValueError("pattern must not be empty")
-        agent.path(args.get("path", "."))
+            raise ToolSchemaError("pattern must not be empty")
         return
 
     if name == "run_shell":
         command = str(args.get("command", "")).strip()
         if not command:
-            raise ValueError("command must not be empty")
-        timeout = int(args.get("timeout", 20))
+            raise ToolSchemaError("command must not be empty")
+        try:
+            timeout = int(args.get("timeout", 20))
+        except (TypeError, ValueError) as exc:
+            raise ToolSchemaError("timeout must be an integer") from exc
         if timeout < 1 or timeout > 120:
-            raise ValueError("timeout must be between 1 and 120 seconds")
+            raise ToolSchemaError("timeout must be between 1 and 120 seconds")
         return
 
     if name == "write_file":
-        path = agent.path(args["path"])
-        if path.exists() and path.is_dir():
-            raise ValueError("path is a directory")
         if "content" not in args:
-            raise ValueError("content must be provided")
+            raise ToolSchemaError("content must be provided")
         return
 
     if name == "patch_file":
-        path = agent.path(args["path"])
-        if not path.is_file():
-            raise ValueError("path is not a file")
         old_text = str(args.get("old_text", ""))
         if not old_text:
-            raise ValueError("old_text must not be empty")
+            raise ToolSchemaError("old_text must not be empty")
         if "new_text" not in args:
-            raise ValueError("missing new_text")
-        text = path.read_text(encoding="utf-8")
-        count = text.count(old_text)
-        if count != 1:
-            raise ValueError(f"old_text must occur exactly once, found {count}")
+            raise ToolSchemaError("missing new_text")
         return
 
     if name == "delegate":
         task = str(args.get("task", "")).strip()
         if not task:
-            raise ValueError("task must not be empty")
+            raise ToolSchemaError("task must not be empty")
         return
 
     if name == "list_skills":
@@ -169,11 +195,51 @@ def validate_tool(agent, name, args):
     if name == "read_skill":
         skill_name = str(args.get("name", "")).strip()
         if not skill_name:
-            raise ValueError("skill name must not be empty")
+            raise ToolSchemaError("skill name must not be empty")
 
         if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
-            raise ValueError("invalid skill name")
+            raise ToolSchemaError("invalid skill name")
         return
+
+
+def validate_tool_state(agent, name, args):
+    """功能：校验工作区状态与路径边界；输入：Agent、工具名和参数；输出：无。"""
+    if name == "list_files":
+        path = _workspace_path(agent, args.get("path", "."))
+        if not path.is_dir():
+            raise ToolStateError("path is not a directory")
+        return
+
+    if name == "read_file":
+        path = _workspace_path(agent, args["path"])
+        if not path.is_file():
+            raise ToolStateError("path is not a file")
+        return
+
+    if name == "search":
+        _workspace_path(agent, args.get("path", "."))
+        return
+
+    if name == "write_file":
+        path = _workspace_path(agent, args["path"])
+        if path.exists() and path.is_dir():
+            raise ToolStateError("path is a directory")
+        return
+
+    if name == "patch_file":
+        path = _workspace_path(agent, args["path"])
+        if not path.is_file():
+            raise ToolStateError("path is not a file")
+        text = path.read_text(encoding="utf-8")
+        count = text.count(str(args["old_text"]))
+        if count != 1:
+            raise ToolStateError(f"old_text must occur exactly once, found {count}")
+
+
+def validate_tool(agent, name, args):
+    """功能：依次校验工具参数和工作区状态；输入：Agent、工具名和参数；输出：无。"""
+    validate_tool_schema(name, args)
+    validate_tool_state(agent, name, args)
 
 
 def tool_list_files(agent, args):
@@ -240,11 +306,7 @@ def tool_search(agent, args):
     return "\n".join(matches) or "(no matches)"
 
 def tool_run_shell(agent, args):
-    """
-    功能：通过 Agent 选定的沙箱执行命令；
-    输入: Agent 与命令参数；
-    输出: 包含退出码、标准输出和错误输出的文本。
-    """
+    """功能：通过 Agent 选定的沙箱执行命令；输入：Agent 与命令参数；输出：包含退出码、标准输出和错误输出的文本。"""
     command = str(args.get("command", "")).strip()
     if not command:
         raise ValueError("command must not be empty")
@@ -299,8 +361,8 @@ def _parse_delegate_result(raw: str) -> str:
     return raw.strip()
 
 def _count_trace_events(agent):
-    """
-    估算父 run 当前 trace 已写了多少条事件。
+    """估算一下父 run 当前 trace 已写了多少条事件。
+
     这是子 task_state.parent_tool_event_index 的来源——viewer 展开父 trace 时
     能高亮那个"调用了子 agent"的 tool_executed 事件。
     """
@@ -408,6 +470,7 @@ def tool_read_skill(agent, args):
         skill_name = skill_name[:-3]
 
     skills_dir = agent.root / ".codini" / "skills"
+
     dir_path = skills_dir / skill_name
     if dir_path.is_dir():
         md_path = dir_path / "SKILL.md"
