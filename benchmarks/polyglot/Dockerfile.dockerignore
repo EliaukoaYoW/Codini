@@ -1,0 +1,8 @@
+**
+!pyproject.toml
+!LICENSE
+!codini/
+!codini/**
+!benchmarks/
+!benchmarks/polyglot/
+!benchmarks/polyglot/verify_toolchains.sh
