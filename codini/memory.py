@@ -379,6 +379,7 @@ def _normalize_note(note, index, workspace_root=None):
             if file_freshness(path, workspace_root) != expected:
                 status = "stale"
                 break
+    conflict_key = _normalize_conflict_key(note.get("conflict_key", ""))
     return {
         "text": text,
         "tags": _dedupe_preserve_order(tags),
@@ -392,6 +393,7 @@ def _normalize_note(note, index, workspace_root=None):
         "evidence": evidence,
         "freshness": freshness,
         "status": status,
+        "conflict_key": conflict_key,
     }
 
 
@@ -523,6 +525,7 @@ def append_note(
     evidence=(),
     freshness_paths=(),
     status="active",
+    conflict_key="",
 ):
     state = normalize_memory_state(state, workspace_root)
     text = clip(str(text).strip(), 500)
@@ -557,6 +560,7 @@ def append_note(
             if str(path).strip()
         },
         "status": str(status).strip(),
+        "conflict_key": str(conflict_key).strip(),
     }
     note = _normalize_note(note, note["note_index"], workspace_root)
     state["next_note_index"] = note["note_index"] + 1
@@ -662,10 +666,15 @@ def _query_file_refs(query, workspace_root=None):
         r"(?<![A-Za-z0-9_.-])(?:[A-Za-z]:[/\\])?[A-Za-z0-9_.-]+"
         r"(?:[/\\][A-Za-z0-9_.-]+)+"
     )
-    return {
-        canonicalize_path(match.group(0), workspace_root).lower()
-        for match in path_pattern.finditer(str(query))
-    }
+    refs = set()
+    for match in path_pattern.finditer(str(query)):
+        # Sentence punctuation is not part of the referenced path. Keeping a
+        # trailing period turns ``services/payments.cfg.`` into a different file
+        # and incorrectly filters out an otherwise applicable file-scoped rule.
+        raw_path = match.group(0).rstrip(".,;:!?)]}，。；：！？）】")
+        if raw_path:
+            refs.add(canonicalize_path(raw_path, workspace_root).lower())
+    return refs
 
 
 def _scope_priority(note, query_file_refs):
@@ -684,11 +693,46 @@ def _scope_priority(note, query_file_refs):
     return 1
 
 
-def _note_conflict_key(note):
-    subject = DurableMemoryStore._subject_key(note.get("text", ""))
-    if not subject:
-        return None
-    return str(note.get("note_type", "observation")), subject
+def _normalize_conflict_key(value):
+    """Normalize an explicitly supplied conflict key."""
+    tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", str(value).lower())
+    return "".join(tokens)
+
+
+def _explicit_conflict_key(note):
+    return _normalize_conflict_key(note.get("conflict_key", "")) or None
+
+
+def _explicit_user_priority(note):
+    if str(note.get("note_type", "observation")) not in {"constraint", "decision"}:
+        return 0
+    if str(note.get("scope", "session")) != "session":
+        return 0
+    source = str(note.get("source", "")).strip().lower()
+    evidence = {str(item).strip().lower() for item in note.get("evidence", [])}
+    return int(source == "user_request" or any(item.startswith("user:") for item in evidence))
+
+
+def _resolution_priority(note, query_file_refs):
+    """Resolve only an explicitly declared rule conflict."""
+    authority = {
+        "constraint": 5,
+        "decision": 4,
+        "error_resolution": 3,
+        "preference": 2,
+        "observation": 1,
+    }.get(str(note.get("note_type", "")), 0)
+    scope = str(note.get("scope", "session"))
+    scope_specificity = {"project": 1, "session": 2, "file": 3}.get(scope, 0)
+    if scope == "file" and _scope_priority(note, query_file_refs) != 3:
+        scope_specificity = 0
+    return (
+        _explicit_user_priority(note),
+        authority,
+        scope_specificity,
+        _parse_timestamp(note.get("created_at")),
+        int(note.get("note_index", 0)),
+    )
 
 
 def retrieval_candidates(state, query, limit=3, workspace_root=None):
@@ -739,20 +783,41 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
                         note,
                     )
                 )
+
     ranked.sort(key=lambda item: item[0], reverse=True)
-    
+
+    # Explicit conflict groups are the only exception to the original order.
+    # The winner occupies the first ranked position of that group; every
+    # non-conflicting candidate keeps its original relative position.
+    conflict_groups = {}
+    for _, note in ranked:
+        conflict_key = _explicit_conflict_key(note)
+        if conflict_key:
+            conflict_groups.setdefault(conflict_key, []).append(note)
+    conflict_winners = {
+        conflict_key: max(
+            notes,
+            key=lambda note: _resolution_priority(note, query_file_refs),
+        )
+        for conflict_key, notes in conflict_groups.items()
+        if len(notes) > 1
+        and any(note.get("note_type") in {"constraint", "decision"} for note in notes)
+    }
+
     seen_texts = set()
     resolved_conflicts = set()
     merged = []
-    for _, note in ranked:
+    for _, ranked_note in ranked:
+        conflict_key = _explicit_conflict_key(ranked_note)
+        resolved_conflict = conflict_key in conflict_winners
+        note = conflict_winners.get(conflict_key, ranked_note)
+        if resolved_conflict and conflict_key in resolved_conflicts:
+            continue
         text = note.get("text", "")
         if text in seen_texts:
             continue
-        conflict_key = _note_conflict_key(note)
-        if conflict_key is not None and conflict_key in resolved_conflicts:
-            continue
         seen_texts.add(text)
-        if conflict_key is not None:
+        if resolved_conflict:
             resolved_conflicts.add(conflict_key)
         merged.append(note)
     return merged[:limit]
@@ -843,6 +908,7 @@ class LayeredMemory:
         evidence=(),
         freshness_paths=(),
         status="active",
+        conflict_key="",
     ):
         self.state = append_note(
             self.state,
@@ -858,6 +924,7 @@ class LayeredMemory:
             evidence=evidence,
             freshness_paths=freshness_paths,
             status=status,
+            conflict_key=conflict_key,
         )
         return self
 

@@ -41,7 +41,7 @@ class ModelToolCall:
             "id": self.call_id,
             "name": self.name,
             "arguments": self.arguments_dict(),
-}
+        }
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,9 @@ class ModelUsage:
             or {}
         )
         input_tokens = payload.get("input_tokens", payload.get("prompt_tokens", 0))
-        output_tokens = payload.get("output_tokens", payload.get("completion_tokens", 0))
+        output_tokens = payload.get(
+            "output_tokens", payload.get("completion_tokens", 0)
+        )
         total_tokens = payload.get("total_tokens")
         cached_tokens = details.get("cached_tokens", payload.get("cached_tokens", 0))
         input_tokens = int(input_tokens or 0)
@@ -165,7 +167,9 @@ class ModelResponse:
         metadata = dict(metadata or {})
         usage = ModelUsage.from_mapping(metadata)
         assistant_text = str(value or "")
-        tool_calls = parse_provider_text_tool_calls(assistant_text) if assistant_text else ()
+        tool_calls = (
+            parse_provider_text_tool_calls(assistant_text) if assistant_text else ()
+        )
         if tool_calls:
             assistant_text = ""
         return cls(
@@ -269,20 +273,45 @@ def normalize_provider_error(error, provider=""):
     code = payload.get("code") or payload.get("type") or ""
     lower = f"{message} {body_text}".lower()
 
-    if status_code in {401, 403} or any(value in lower for value in ("unauthorized", "invalid api key", "authentication")):
+    if status_code in {401, 403} or any(
+        value in lower
+        for value in ("unauthorized", "invalid api key", "authentication")
+    ):
         kind = ModelErrorKind.AUTHENTICATION
-    elif status_code == 429 or any(value in lower for value in ("rate limit", "rate_limit", "too many requests")):
+    elif status_code == 429 or any(
+        value in lower for value in ("rate limit", "rate_limit", "too many requests")
+    ):
         kind = ModelErrorKind.RATE_LIMIT
-    elif any(value in lower for value in ("context length", "context_length", "maximum context", "too many tokens")):
+    elif any(
+        value in lower
+        for value in (
+            "context length",
+            "context_length",
+            "maximum context",
+            "too many tokens",
+        )
+    ):
         kind = ModelErrorKind.CONTEXT_LENGTH
     elif any(value in lower for value in ("refusal", "refused", "safety policy")):
         kind = ModelErrorKind.REFUSAL
-    elif any(value in lower for value in ("tool call", "tool_call", "function call", "malformed tool")):
+    elif any(
+        value in lower
+        for value in ("tool call", "tool_call", "function call", "malformed tool")
+    ):
         kind = ModelErrorKind.TOOL_FORMAT
-    elif status_code in {408, 409, 425, 500, 502, 503, 504} or isinstance(
-        error,
-        (urllib.error.URLError, TimeoutError, ConnectionRefusedError, RemoteDisconnected),
-    ) or "timeout" in lower:
+    elif (
+        status_code in {408, 409, 425, 500, 502, 503, 504}
+        or isinstance(
+            error,
+            (
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionRefusedError,
+                RemoteDisconnected,
+            ),
+        )
+        or "timeout" in lower
+    ):
         kind = ModelErrorKind.TRANSIENT
     elif isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
         kind = ModelErrorKind.INVALID_RESPONSE
@@ -325,7 +354,9 @@ def execute_with_retry(operation, *, provider, timeout, policy=DEFAULT_RETRY_POL
     for attempt in range(max(1, policy.max_attempts)):
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
-            error = normalize_provider_error(TimeoutError("provider request deadline exceeded"), provider)
+            error = normalize_provider_error(
+                TimeoutError("provider request deadline exceeded"), provider
+            )
             raise error.with_attempts(attempt or 1) from last_error
         try:
             return operation(remaining)
@@ -352,7 +383,11 @@ def _parse_call_args(text):
             value.startswith("'") and value.endswith("'")
         ):
             try:
-                value = json.loads(value) if value.startswith('"') else value[1:-1].replace("\\'", "'")
+                value = (
+                    json.loads(value)
+                    if value.startswith('"')
+                    else value[1:-1].replace("\\'", "'")
+                )
             except Exception:
                 value = value[1:-1]
         elif re.fullmatch(r"-?\d+", value):
@@ -402,7 +437,9 @@ def _parse_longcat(body):
     if call_match:
         name, args_text = call_match.group("name"), call_match.group("args")
     else:
-        attr_match = re.match(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<args>.*)$", body, re.S)
+        attr_match = re.match(
+            r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<args>.*)$", body, re.S
+        )
         if not attr_match:
             return None
         name, args_text = attr_match.group("name"), attr_match.group("args")
@@ -425,19 +462,29 @@ def _parse_json_tool_body(body):
         return None
     if not isinstance(payload, dict):
         return None
-    function = payload.get("function") if isinstance(payload.get("function"), dict) else payload
+    function = (
+        payload.get("function")
+        if isinstance(payload.get("function"), dict)
+        else payload
+    )
     name = str(function.get("name") or payload.get("name") or "").strip()
-    arguments = function.get("arguments", function.get("args", payload.get("arguments", {})))
+    arguments = function.get(
+        "arguments", function.get("args", payload.get("arguments", {}))
+    )
     if not name:
         return None
     return ModelToolCall(name=name, arguments=arguments)
 
 
-def parse_provider_text_tool_calls(text, formats=("longcat_tool_call", "tool_call", "tool")):
+def parse_provider_text_tool_calls(
+    text, formats=("longcat_tool_call", "tool_call", "tool")
+):
     """按 Provider 适配器声明的格式解析文本工具调用。"""
     text = str(text or "")
     for tag in formats:
-        match = re.search(rf"<{re.escape(tag)}>(?P<body>.*?)(?:</{re.escape(tag)}>|$)", text, re.S)
+        match = re.search(
+            rf"<{re.escape(tag)}>(?P<body>.*?)(?:</{re.escape(tag)}>|$)", text, re.S
+        )
         if not match:
             continue
         body = match.group("body")
@@ -448,6 +495,7 @@ def parse_provider_text_tool_calls(text, formats=("longcat_tool_call", "tool_cal
         if call:
             return (call,)
     return ()
+
 
 def _urlopen_interruptible(request, timeout):
     """urlopen wrapped in a thread so KeyboardInterrupt can escape the blocking socket call on Windows."""
@@ -478,6 +526,7 @@ def _normalize_versioned_base_url(base_url):
     if not base.endswith("/v1"):
         base += "/v1"
     return base
+
 
 def _extract_openai_text(data):
     if data.get("output_text"):
@@ -524,7 +573,10 @@ def _extract_openai_tool_calls(data):
                 )
 
     for item in data.get("output", []) or []:
-        if not isinstance(item, dict) or item.get("type") not in {"function_call", "tool_call"}:
+        if not isinstance(item, dict) or item.get("type") not in {
+            "function_call",
+            "tool_call",
+        }:
             continue
         name = str(item.get("name") or "").strip()
         if name:
@@ -559,6 +611,189 @@ def _model_response_from_openai_payload(data, provider, fallback_text=""):
     )
 
 
+def _anthropic_tools(tools):
+    """Convert provider-neutral/OpenAI-style function tools to Anthropic tools."""
+    converted = []
+    for item in tools or ():
+        item = dict(item or {})
+        function = (
+            item.get("function") if isinstance(item.get("function"), Mapping) else item
+        )
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        tool = {
+            "name": name,
+            "input_schema": dict(
+                function.get("input_schema")
+                or function.get("parameters")
+                or {"type": "object", "properties": {}}
+            ),
+        }
+        description = str(function.get("description") or "").strip()
+        if description:
+            tool["description"] = description
+        converted.append(tool)
+    return converted
+
+
+def _anthropic_messages(request):
+    """Keep Anthropic's top-level system prompt separate from user/assistant messages."""
+    system_parts = [str(request.system_prompt)] if request.system_prompt else []
+    messages = []
+    for message in request.messages:
+        role = str(message.role or "user").strip().lower()
+        if role == "system":
+            system_parts.append(str(message.content))
+            continue
+        if role not in {"user", "assistant"}:
+            role = "user"
+        messages.append({"role": role, "content": message.content})
+    return messages, "\n\n".join(part for part in system_parts if part)
+
+
+def _model_response_from_anthropic_payload(data, provider="anthropic-compatible"):
+    """Normalize Anthropic Messages content blocks into the shared response model."""
+    texts = []
+    calls = []
+    for block in data.get("content", []) or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+        elif block.get("type") == "tool_use":
+            name = str(block.get("name") or "").strip()
+            if name:
+                calls.append(
+                    ModelToolCall(
+                        name=name,
+                        arguments=block.get("input") or {},
+                        call_id=str(block.get("id") or ""),
+                    )
+                )
+
+    usage_payload = dict(data.get("usage") or {})
+    cache_read_tokens = int(usage_payload.get("cache_read_input_tokens") or 0)
+    cache_creation_tokens = int(usage_payload.get("cache_creation_input_tokens") or 0)
+    uncached_input_tokens = int(usage_payload.get("input_tokens") or 0)
+    output_tokens = int(usage_payload.get("output_tokens") or 0)
+    input_tokens = uncached_input_tokens + cache_read_tokens + cache_creation_tokens
+    usage = ModelUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        cached_tokens=cache_read_tokens,
+    )
+    return ModelResponse(
+        assistant_text="".join(texts),
+        tool_calls=tuple(calls),
+        usage=usage,
+        finish_reason=data.get("stop_reason"),
+        raw_response=data,
+        provider=provider,
+    )
+
+
+def _anthropic_response_from_sse(body_text, provider="anthropic-compatible"):
+    """Assemble Anthropic Messages SSE events into one normalized response."""
+    content = []
+    blocks = {}
+    usage = {}
+    stop_reason = None
+    message_id = ""
+    model = ""
+
+    for line in str(body_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type == "error":
+            error = event.get("error") or {}
+            raise normalize_provider_error(
+                RuntimeError(
+                    str(error.get("message") or error or "Anthropic stream error")
+                ),
+                provider,
+            )
+        if event_type == "message_start":
+            message = event.get("message") or {}
+            message_id = str(message.get("id") or "")
+            model = str(message.get("model") or "")
+            usage.update(message.get("usage") or {})
+            continue
+        if event_type == "content_block_start":
+            index = int(event.get("index") or 0)
+            block = dict(event.get("content_block") or {})
+            if block.get("type") == "text":
+                block["text"] = str(block.get("text") or "")
+            elif block.get("type") == "tool_use":
+                block["input"] = block.get("input") or {}
+                block["_partial_json"] = ""
+            blocks[index] = block
+            continue
+        if event_type == "content_block_delta":
+            index = int(event.get("index") or 0)
+            delta = event.get("delta") or {}
+            block = blocks.setdefault(index, {})
+            if delta.get("type") == "text_delta":
+                block["type"] = "text"
+                block["text"] = str(block.get("text") or "") + str(
+                    delta.get("text") or ""
+                )
+            elif delta.get("type") == "input_json_delta":
+                block["type"] = "tool_use"
+                block["_partial_json"] = str(block.get("_partial_json") or "") + str(
+                    delta.get("partial_json") or ""
+                )
+            continue
+        if event_type == "message_delta":
+            delta = event.get("delta") or {}
+            stop_reason = delta.get("stop_reason") or stop_reason
+            usage.update(event.get("usage") or {})
+
+    for index in sorted(blocks):
+        block = blocks[index]
+        if block.get("type") == "tool_use":
+            partial_json = str(block.pop("_partial_json", "") or "").strip()
+            if partial_json:
+                try:
+                    block["input"] = json.loads(partial_json)
+                except json.JSONDecodeError as exc:
+                    raise ModelProviderError(
+                        ModelErrorKind.TOOL_FORMAT,
+                        f"Anthropic tool input is not valid JSON: {exc}",
+                        provider=provider,
+                    ) from exc
+        content.append(block)
+
+    if not content:
+        raise ModelProviderError(
+            ModelErrorKind.INVALID_RESPONSE,
+            f"{provider} stream did not contain text or tool calls",
+            provider=provider,
+        )
+    payload = {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": usage,
+    }
+    return _model_response_from_anthropic_payload(payload, provider)
+
+
 def _normalize_text_tool_response(response):
     """把 Provider 文本协议在适配层转换成统一 ToolCall。"""
     if response.tool_calls or not response.assistant_text:
@@ -576,56 +811,6 @@ def _normalize_text_tool_response(response):
     )
 
 
-def _extract_openai_text_from_sse(body_text):
-    last_response = None
-    deltas = []
-    for line in body_text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        event_type = event.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-            continue
-        if event_type == "response.output_text.done":
-            text = event.get("text")
-            if text and isinstance(text, str):
-                return text
-        part = event.get("part")
-        if isinstance(part, dict):
-            text = part.get("text")
-            if text and isinstance(text, str):
-                return text
-        item = event.get("item")
-        if isinstance(item, dict):
-            text = _extract_openai_text({"output": [item]})
-            if text:
-                return text
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_response = response
-            text = _extract_openai_text(response)
-            if text:
-                return text
-        text = _extract_openai_text(event)
-        if text:
-            return text
-    if deltas:
-        return "".join(deltas)
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response)
-    return ""
-
-
 def _extract_openai_response_from_sse(body_text):
     last_response = None
     deltas = []
@@ -633,7 +818,7 @@ def _extract_openai_response_from_sse(body_text):
         line = line.strip()
         if not line.startswith("data:"):
             continue
-        payload = line[len("data:"):].strip()
+        payload = line[len("data:") :].strip()
         if not payload or payload == "[DONE]":
             continue
         try:
@@ -667,22 +852,6 @@ def _extract_openai_response_from_sse(body_text):
     return "", {}
 
 
-def _extract_usage_cache_details(data):
-    # 把不同 OpenAI-compatible 返回里的 usage 字段整理成统一结构，让 runtime/trace/report 不需要关心 provider 细节。
-    usage = data.get("usage") or {}
-    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
-    output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
-    cached_tokens = int(input_details.get("cached_tokens") or 0)
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": usage.get("total_tokens"),
-        "cached_tokens": cached_tokens,
-        "cache_hit": cached_tokens > 0,
-    }
-
-
 class _ModelClientBase:
     """保留 complete() 兼容入口，并在内部提供统一响应。"""
 
@@ -709,7 +878,9 @@ class _ModelClientBase:
             response = self._complete_request(request)
         self.last_completion_metadata = {
             **response.to_metadata(),
-            "prompt_cache_supported": bool(getattr(self, "supports_prompt_cache", False)),
+            "prompt_cache_supported": bool(
+                getattr(self, "supports_prompt_cache", False)
+            ),
             "prompt_cache_key": getattr(response, "prompt_cache_key", None)
             or kwargs.get("prompt_cache_key"),
             "prompt_cache_retention": kwargs.get("prompt_cache_retention"),
@@ -741,7 +912,17 @@ class FakeModelClient(_ModelClientBase):
 
 
 class OllamaModelClient(_ModelClientBase):
-    def __init__(self, model, host=None, temperature=0.2, top_p=0.9, timeout=300, *, base_url=None, api_key=None):
+    def __init__(
+        self,
+        model,
+        host=None,
+        temperature=0.2,
+        top_p=0.9,
+        timeout=300,
+        *,
+        base_url=None,
+        api_key=None,
+    ):
         del api_key
         self.model = model
         self.host = str(base_url or host or "http://127.0.0.1:11434").rstrip("/")
@@ -760,7 +941,9 @@ class OllamaModelClient(_ModelClientBase):
             "think": False,
             "options": {
                 "num_predict": request.max_tokens,
-                "temperature": self.temperature if request.temperature is None else request.temperature,
+                "temperature": self.temperature
+                if request.temperature is None
+                else request.temperature,
                 "top_p": self.top_p,
             },
         }
@@ -778,17 +961,23 @@ class OllamaModelClient(_ModelClientBase):
         try:
             data = json.loads(body_text)
         except json.JSONDecodeError as exc:
-            raise ModelProviderError("invalid_response", f"Ollama response is not valid JSON: {exc}", provider="ollama") from exc
+            raise ModelProviderError(
+                "invalid_response",
+                f"Ollama response is not valid JSON: {exc}",
+                provider="ollama",
+            ) from exc
         if data.get("error"):
             raise normalize_provider_error(RuntimeError(str(data["error"])), "ollama")
-        return _normalize_text_tool_response(ModelResponse(
-            assistant_text=str(data.get("response", "")),
-            tool_calls=_extract_openai_tool_calls(data),
-            usage=ModelUsage.from_mapping(data.get("usage") or data),
-            finish_reason=data.get("finish_reason"),
-            raw_response=data,
-            provider="ollama",
-        ))
+        return _normalize_text_tool_response(
+            ModelResponse(
+                assistant_text=str(data.get("response", "")),
+                tool_calls=_extract_openai_tool_calls(data),
+                usage=ModelUsage.from_mapping(data.get("usage") or data),
+                finish_reason=data.get("finish_reason"),
+                raw_response=data,
+                provider="ollama",
+            )
+        )
 
 
 class _OpenAICompatibleModelClient(_ModelClientBase):
@@ -810,7 +999,9 @@ class _OpenAICompatibleModelClient(_ModelClientBase):
             self.output_token_field: request.max_tokens,
             "stream": request.stream,
         }
-        temperature = self.temperature if request.temperature is None else request.temperature
+        temperature = (
+            self.temperature if request.temperature is None else request.temperature
+        )
         if temperature is not None:
             payload["temperature"] = temperature
         if request.tools:
@@ -838,16 +1029,22 @@ class _OpenAICompatibleModelClient(_ModelClientBase):
             timeout=self.timeout,
         )
         content_type = response_headers.get("Content-Type", "")
-        if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
+        if content_type.startswith(
+            "text/event-stream"
+        ) or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
             if response_data and isinstance(response_data, dict):
-                return _normalize_text_tool_response(_model_response_from_openai_payload(
-                    response_data,
-                    self.provider_name,
-                    fallback_text=text,
-                ))
+                return _normalize_text_tool_response(
+                    _model_response_from_openai_payload(
+                        response_data,
+                        self.provider_name,
+                        fallback_text=text,
+                    )
+                )
             if text:
-                return _normalize_text_tool_response(ModelResponse(assistant_text=text, provider=self.provider_name))
+                return _normalize_text_tool_response(
+                    ModelResponse(assistant_text=text, provider=self.provider_name)
+                )
             raise ModelProviderError(
                 "invalid_response",
                 f"{self.provider_name} response did not contain text or tool calls",
@@ -862,15 +1059,20 @@ class _OpenAICompatibleModelClient(_ModelClientBase):
                 provider=self.provider_name,
             ) from exc
         if data.get("error"):
-            raise normalize_provider_error(RuntimeError(str(data["error"])), self.provider_name)
-        return _normalize_text_tool_response(_model_response_from_openai_payload(data, self.provider_name))
+            raise normalize_provider_error(
+                RuntimeError(str(data["error"])), self.provider_name
+            )
+        return _normalize_text_tool_response(
+            _model_response_from_openai_payload(data, self.provider_name)
+        )
 
 
 class OpenAICompatibleModelClient(_OpenAICompatibleModelClient):
     def __init__(self, model, base_url, api_key, temperature, timeout):
         super().__init__(model, base_url, api_key, temperature, timeout)
         self.supports_prompt_cache = any(
-            host in self.base_url for host in ("openai.com", "right.codes", "longcat", "deepseek")
+            host in self.base_url
+            for host in ("openai.com", "right.codes", "longcat", "deepseek")
         )
 
 
@@ -881,8 +1083,81 @@ class SiliconflowModelClient(_OpenAICompatibleModelClient):
     def __init__(self, model, base_url, api_key, temperature, timeout):
         super().__init__(model, base_url, api_key, temperature, timeout)
         self.supports_prompt_cache = any(
-            host in self.base_url for host in ("openai.com", "right.codes", "siliconflow.cn")
+            host in self.base_url
+            for host in ("openai.com", "right.codes", "siliconflow.cn")
         )
+
+
+class AnthropicCompatibleModelClient(_ModelClientBase):
+    provider_name = "anthropic-compatible"
+    anthropic_version = "2023-06-01"
+
+    def __init__(self, model, base_url, api_key, temperature, timeout):
+        self.model = model
+        self.base_url = _normalize_versioned_base_url(base_url)
+        self.api_key = api_key
+        self.temperature = temperature
+        self.timeout = timeout
+        self.supports_prompt_cache = False
+        self.last_completion_metadata = {}
+
+    def _build_payload(self, request):
+        messages, system_prompt = _anthropic_messages(request)
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": request.max_tokens,
+            "stream": request.stream,
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+        temperature = (
+            self.temperature if request.temperature is None else request.temperature
+        )
+        if temperature is not None:
+            payload["temperature"] = temperature
+        tools = _anthropic_tools(request.tools)
+        if tools:
+            payload["tools"] = tools
+        return payload
+
+    def _complete_request(self, request):
+        payload = self._build_payload(request)
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": self.anthropic_version,
+        }
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+        http_request = urllib.request.Request(
+            f"{self.base_url}/messages",
+            method="POST",
+            headers=headers,
+            data=json.dumps(payload).encode("utf-8"),
+        )
+        body_text, response_headers = execute_with_retry(
+            lambda timeout: _urlopen_interruptible(http_request, timeout),
+            provider=self.provider_name,
+            timeout=self.timeout,
+        )
+        content_type = response_headers.get("Content-Type", "")
+        if content_type.startswith(
+            "text/event-stream"
+        ) or body_text.lstrip().startswith("data:"):
+            return _anthropic_response_from_sse(body_text, self.provider_name)
+        try:
+            data = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            raise ModelProviderError(
+                "invalid_response",
+                f"{self.provider_name} response is not valid JSON: {exc}",
+                provider=self.provider_name,
+            ) from exc
+        if data.get("error"):
+            raise normalize_provider_error(
+                RuntimeError(str(data["error"])), self.provider_name
+            )
+        return _model_response_from_anthropic_payload(data, self.provider_name)
 
 
 @dataclass(frozen=True)
@@ -906,9 +1181,7 @@ def configured_model_names(default_model="", model_list=""):
     if default_model:
         names.append(default_model)
     names.extend(
-        item.strip()
-        for item in str(model_list or "").split(",")
-        if item.strip()
+        item.strip() for item in str(model_list or "").split(",") if item.strip()
     )
     return tuple(dict.fromkeys(names))
 
@@ -940,9 +1213,7 @@ def provider_spec(provider):
         return PROVIDER_SPECS[provider]
     except KeyError as exc:
         supported = ", ".join(PROVIDER_SPECS)
-        raise ValueError(
-            f"不支持的 Provider：{provider}；可选值：{supported}"
-        ) from exc
+        raise ValueError(f"不支持的 Provider：{provider}；可选值：{supported}") from exc
 
 
 def provider_names():
@@ -1000,5 +1271,11 @@ PROVIDER_SPECS = {
         base_url_envs="OLLAMA_BASE_URL",
         api_key_envs="OLLAMA_API_KEY",
         api_key_required=False,
+    ),
+    "anthropic": ProviderSpec(
+        client_cls=AnthropicCompatibleModelClient,
+        model_env="ANTHROPIC_MODEL",
+        base_url_envs="ANTHROPIC_BASE_URL",
+        api_key_envs="ANTHROPIC_API_KEY",
     ),
 }
