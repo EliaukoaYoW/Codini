@@ -1,4 +1,5 @@
 from .models import (
+    AnthropicCompatibleModelClient,
     FakeModelClient,
     ModelErrorKind,
     ModelProviderError,
@@ -15,13 +16,17 @@ from .workspace import WorkspaceContext
 
 _CLI_EXPORTS = {"build_agent", "build_arg_parser", "build_welcome", "main"}
 
+
 def __getattr__(name):
     if name in _CLI_EXPORTS:
         from . import cli
+
         return getattr(cli, name)
     raise AttributeError(f"module 'codini' has no attribute {name!r}")
 
+
 __all__ = [
+    "AnthropicCompatibleModelClient",
     "FakeModelClient",
     "Codini",
     "RunStore",
@@ -41,4 +46,3 @@ __all__ = [
     "SessionStore",
     "WorkspaceContext",
 ]
-
