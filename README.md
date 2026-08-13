@@ -41,7 +41,7 @@ Codini 是一个运行在终端里的轻量 Coding Agent。它读取当前 Git �
 | 分层记忆 | 区分 Working Memory、Episodic Memory 与显式晋升的 Durable Memory |
 | 动态执行预算 | 有进展时扩展工具步数，重复或持续无进展时提前停止 |
 | 只读委派 | 可把有界调查交给只读子 Agent，并在 trace 中保留父子运行关系 |
-| Skills | 从 `.codini/skills/` 加载项目内的 Markdown 指令或 `SKILL.md` 包 |
+| SKILLS | 从 `.codini/skills/` 加载项目内的 Markdown 指令或 `SKILL.md` 包 |
 | 实时追踪 | 本地 HTTP viewer 持续轮询运行数据 |
 | 敏感信息保护 | trace/report 写入前进行凭据字段与已知 secret 值脱敏 |
 
@@ -100,7 +100,7 @@ source .venv/bin/activate
 
 ### 2. 配置模型
 
-Codini 会自动读取当前目录下的 `.env`（需要手动创建）。下面两种 provider 任选其一。
+Codini 会自动读取当前目录下的 `.env`（需要参考 `.env.example` 手动创建）。
 
 兼容 OpenAI API 格式的 Provider：
 
@@ -108,14 +108,6 @@ Codini 会自动读取当前目录下的 `.env`（需要手动创建）。下面
 OPENAI_API_KEY=your_api_key
 OPENAI_BASE_URL=https://api.example.com
 OPENAI_MODEL=your-model
-```
-
-SiliconFlow：
-
-```dotenv
-SILICONFLOW_API_KEY=your_api_key
-SILICONFLOW_BASE_URL=https://api.siliconflow.cn
-SILICONFLOW_MODEL=deepseek-ai/DeepSeek-V4-Flash
 ```
 
 每个 Provider 的 API key、base URL 和模型名都是必需配置。`--model` 与 `--base-url` 会覆盖对应环境变量；缺少配置时 CLI 会指出具体变量。API base URL 可以带或不带 `/v1`，Codini 会进行规范化。
@@ -137,11 +129,6 @@ codini --cwd . --provider openai
 codini --cwd . --provider openai "先分析测试失败的根因，只报告，不修改文件"
 ```
 
-SiliconFlow：
-
-```bash
-codini --cwd . --provider siliconflow
-```
 
 Codini 默认使用 `--approval ask`，并在 `127.0.0.1:8765` 启动当前 session 的实时 trace viewer。
 
