@@ -26,4 +26,4 @@ dev = [
 include = ["codini*"]
 
 [tool.setuptools.package-data]
-"codini.viz" = ["templates/*.html"]
+"codini.trace" = ["templates/*.html"]

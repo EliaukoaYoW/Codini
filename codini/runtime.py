@@ -29,7 +29,7 @@ from .sandbox import NoSandbox
 from .models import ModelResponse, ModelProviderError
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
-from .trace import Tracer, TraceSpanProcessor, FileSpanExporter, Span
+from .trace import Tracer, TraceSpanProcessor, FileSpanExporter
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"

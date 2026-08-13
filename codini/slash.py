@@ -108,69 +108,6 @@ def get_key_win():
     return ch
 
 
-def get_key_unix():
-    import tty
-    import termios
-    import select
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        # 使用 os.read 进行完全系统级的无缓冲读取，防止 Python text wrapper 预读数据包
-        b = os.read(fd, 1)
-        if not b:
-            return None
-        first_byte = b[0]
-        # 根据 UTF-8 首字节确定总字节数（中文占 3 字节，emoji 占 4 字节）
-        if first_byte < 0x80:
-            total = 1
-        elif first_byte < 0xE0:
-            total = 2
-        elif first_byte < 0xF0:
-            total = 3
-        else:
-            total = 4
-        raw = b
-        for _ in range(total - 1):
-            extra = os.read(fd, 1)
-            if extra:
-                raw += extra
-        ch = raw.decode('utf-8', errors='replace')
-        if ch == '\x1b':
-            # 检测缓冲区中是否存在后续转义序列字节
-            r, _, _ = select.select([fd], [], [], 0.05)
-            if r:
-                b2 = os.read(fd, 1)
-                ch2 = b2.decode('utf-8', errors='ignore')
-                if ch2 == '[':
-                    r, _, _ = select.select([fd], [], [], 0.05)
-                    if r:
-                        b3 = os.read(fd, 1)
-                        ch3 = b3.decode('utf-8', errors='ignore')
-                        if ch3 == 'A':
-                            return 'up'
-                        if ch3 == 'B':
-                            return 'down'
-                        if ch3 == 'C':
-                            return 'right'
-                        if ch3 == 'D':
-                            return 'left'
-            return 'escape'
-        if ch in ('\r', '\n'):
-            return 'enter'
-        if ch == '\t':
-            return 'tab'
-        if ch in ('\x7f', '\x08'):
-            return 'backspace'
-        if ch == '\x03':
-            raise KeyboardInterrupt
-        if ch == '\x04':
-            raise EOFError
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-
 def get_matches(current_text, commands_help, common_models, skills=None):
     if not current_text.startswith('/'):
         return []

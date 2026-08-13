@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import random
+import shutil
 import tempfile
 import time
 from datetime import datetime
@@ -456,6 +457,7 @@ def _memory_v3_seed_task(agent, task, workspace_root, run_refs):
             scope_refs=("services/payments.cfg",),
             evidence=("fixture:file_constraint", "services/payments.cfg"),
             freshness_paths=("services/payments.cfg",),
+            conflict_key="retry.limit",
         )
         agent.memory.append_note(
             "retry limit is 5",
@@ -464,6 +466,7 @@ def _memory_v3_seed_task(agent, task, workspace_root, run_refs):
             note_type="constraint",
             scope="project",
             evidence=("fixture:project_default",),
+            conflict_key="retry.limit",
         )
         agent.session["memory"] = agent.memory.to_dict()
         agent.session_path = agent.session_store.save(agent.session)
@@ -848,59 +851,6 @@ def _memory_v3_run_followup(agent, task, row, workspace_root, run_refs):
     _memory_v3_evaluate_followup(agent, task, row, result_path)
 
 
-def _run_memory_v3_scenario(task, variant, provider, repetition, request_timeout):
-    """Compatibility path for running one isolated scenario, including its Seed."""
-    row = _memory_v3_empty_row(task, variant, repetition)
-
-    with tempfile.TemporaryDirectory(prefix="codini-memory-v3-") as temp_dir:
-        workspace_root = Path(temp_dir)
-        run_refs = []
-        agents = []
-        durable_quarantine = None
-        try:
-            _memory_v3_write_fixtures(workspace_root, task)
-            agent = _memory_v3_build_agent(workspace_root, provider, request_timeout)
-            agents.append(agent)
-            runtime_task = dict(task)
-            runtime_task["_provider"] = provider
-            runtime_task["_request_timeout"] = request_timeout
-            agent = _memory_v3_seed_task(agent, runtime_task, workspace_root, run_refs)
-            if agent not in agents:
-                agents.append(agent)
-            row["setup_valid"] = _memory_v3_setup_valid(agent, task)
-
-            if task["category"] != "durable":
-                _memory_v3_rollover_seed_history(agent)
-                _memory_v3_inject_history_pressure(agent)
-                _memory_v3_apply_variant(agent, variant)
-            else:
-                if variant in {"durable_off", "memory_off"}:
-                    durable_quarantine = _memory_v3_disable_durable(workspace_root)
-                agent = _memory_v3_resume_agent(
-                    agent,
-                    provider,
-                    request_timeout,
-                    new_session=True,
-                )
-                agents.append(agent)
-                if variant == "memory_off":
-                    _memory_v3_apply_variant(agent, variant)
-
-            _memory_v3_run_followup(
-                agent,
-                task,
-                row,
-                workspace_root,
-                run_refs,
-            )
-        except Exception as exc:
-            row["provider_error"] = f"{exc.__class__.__name__}: {exc}"
-        finally:
-            _memory_v3_restore_durable(workspace_root, durable_quarantine)
-            row.update(_memory_v3_usage(_memory_v3_trace_events(run_refs)))
-    return row
-
-
 def _memory_v3_prepare_shared_seed(task, provider, repetition, request_timeout, workspace_root):
     run_refs = []
     agent = None
@@ -933,15 +883,42 @@ def _memory_v3_prepare_shared_seed(task, provider, repetition, request_timeout, 
     return agent, seed_row
 
 
-def _memory_v3_clone_seed_agent(seed_agent, provider, request_timeout, variant, repetition):
-    session = copy.deepcopy(seed_agent.session)
-    session["id"] = (
-        f"{seed_agent.session['id']}-{variant}-r{int(repetition)}"
-    )
+def _memory_v3_copy_seed_workspace(seed_root, variant_root):
+    """Copy an immutable Seed without exposing Seed sessions or run traces."""
+    seed_root = Path(seed_root)
+    variant_root = Path(variant_root)
+
+    def ignore_runtime_state(directory, names):
+        if Path(directory).name != ".codini":
+            return []
+        return [name for name in names if name in {"sessions", "runs"}]
+
+    shutil.copytree(seed_root, variant_root, ignore=ignore_runtime_state)
+    return variant_root
+
+
+def _memory_v3_clone_seed_agent(
+    seed_agent,
+    provider,
+    request_timeout,
+    variant,
+    repetition,
+    workspace_root,
+):
+    workspace_root = Path(workspace_root)
+    workspace = WorkspaceContext.build(workspace_root, repo_root_override=workspace_root)
+    session_store = SessionStore(workspace_root / ".codini" / "sessions")
+    session = {
+        "id": f"{seed_agent.session['id']}-{variant}-r{int(repetition)}",
+        "created_at": seed_agent.session.get("created_at", ""),
+        "workspace_root": str(workspace_root),
+        "history": copy.deepcopy(seed_agent.session.get("history", [])),
+        "memory": copy.deepcopy(seed_agent.session.get("memory", memorylib.default_memory_state())),
+    }
     return Codini(
         model_client=_make_provider_client(provider, timeout=request_timeout),
-        workspace=seed_agent.workspace,
-        session_store=seed_agent.session_store,
+        workspace=workspace,
+        session_store=session_store,
         session=session,
         approval_policy="auto",
         max_steps=8,
@@ -968,11 +945,10 @@ def _run_memory_v3_variant_from_seed(
         if task["category"] == "durable":
             if variant in {"durable_off", "memory_off"}:
                 durable_quarantine = _memory_v3_disable_durable(workspace_root)
-            agent = _memory_v3_resume_agent(
-                seed_agent,
+            agent = _memory_v3_build_agent(
+                workspace_root,
                 provider,
                 request_timeout,
-                new_session=True,
             )
             if variant == "memory_off":
                 _memory_v3_apply_variant(agent, variant)
@@ -983,6 +959,7 @@ def _run_memory_v3_variant_from_seed(
                 request_timeout,
                 variant,
                 repetition,
+                workspace_root,
             )
             _memory_v3_rollover_seed_history(agent)
             _memory_v3_inject_history_pressure(agent)
@@ -1116,16 +1093,23 @@ def run_memory_mechanism_ablation_v3(
                         f"seed_failed: {seed_row['provider_error'] or 'seed agent unavailable'}"
                     )
                 else:
-                    row = _run_memory_v3_variant_from_seed(
-                        seed_agent=seed_agent,
-                        seed_row=seed_row,
-                        task=task,
-                        variant=variant,
-                        provider=provider,
-                        repetition=repetition,
-                        request_timeout=request_timeout,
-                        workspace_root=workspace_root,
-                    )
+                    with tempfile.TemporaryDirectory(
+                        prefix=f"codini-memory-v3-{variant}-"
+                    ) as variant_temp_dir:
+                        variant_workspace_root = _memory_v3_copy_seed_workspace(
+                            workspace_root,
+                            Path(variant_temp_dir) / "workspace",
+                        )
+                        row = _run_memory_v3_variant_from_seed(
+                            seed_agent=seed_agent,
+                            seed_row=seed_row,
+                            task=task,
+                            variant=variant,
+                            provider=provider,
+                            repetition=repetition,
+                            request_timeout=request_timeout,
+                            workspace_root=variant_workspace_root,
+                        )
                 row["expected_note_marker"] = task.get("expected_note_marker", "")
                 rows.append(row)
 
@@ -1176,6 +1160,8 @@ def run_memory_mechanism_ablation_v3(
         "methodology": {
             "real_client": True,
             "shared_seed_per_task_repetition": True,
+            "isolated_workspace_per_variant": True,
+            "seed_runtime_state_excluded_from_variants": ["sessions", "runs"],
             "scope_resolution": "explicit scope_refs with deterministic conflict resolution",
             "durable_off_isolation": "quarantined outside the agent workspace",
             "false_persistence_definition": "explicit forbidden-value recall only",
@@ -1740,7 +1726,7 @@ def run_real_context_experiment(
 
 def run_context_allocation_ablation_v3(
     artifact_path=DEFAULT_CONTEXT_ALLOCATION_V3_PATH,
-    provider="stepfun",
+    provider="openai",
     repetitions=3,
     total_budget=DEFAULT_TOTAL_BUDGET,
     request_timeout=180,
