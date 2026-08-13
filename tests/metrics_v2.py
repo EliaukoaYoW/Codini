@@ -5,11 +5,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from codini.evaluator import run_fixed_benchmark
 from codini.models import (
     FakeModelClient,
-    OpenAICompatibleModelClient,
-    SiliconflowModelClient,
     provider_spec,
 )
 from codini.runtime import Codini, SessionStore
@@ -732,31 +729,6 @@ def run_security_experiment_suite(repetitions=3):
     }
 
 
-def _provider_summary_from_artifact(payload):
-    rows = list(payload.get("rows", []))
-    cached_tokens = []
-    cache_hits = []
-    tool_steps = []
-    attempts = []
-    for row in rows:
-        report = row.get("report", {})
-        prompt_metadata = report.get("prompt_metadata", {})
-        cached_tokens.append(int(prompt_metadata.get("cached_tokens", 0) or 0))
-        cache_hits.append(bool(prompt_metadata.get("cache_hit")))
-        tool_steps.append(int(row.get("tool_steps", 0)))
-        attempts.append(int(row.get("attempts", 0)))
-    summary = payload.get("summary", {})
-    return {
-        "status": "completed",
-        "task_count": int(summary.get("total_tasks", len(rows))),
-        "pass_rate": float(summary.get("pass_rate", 0.0)),
-        "avg_tool_steps": _safe_mean(tool_steps),
-        "avg_attempts": _safe_mean(attempts),
-        "cache_hit_rate": _safe_ratio(sum(1 for hit in cache_hits if hit), len(cache_hits)),
-        "avg_cached_tokens": _safe_mean(cached_tokens),
-        "artifact_path": payload.get("_artifact_path", ""),
-    }
-
 def _provider_profile(provider):
     """功能：读取评估 Provider 配置；输入：Provider 名称；输出：ready 或 blocked 的配置字典。"""
     try:
@@ -828,63 +800,6 @@ def _normalize_text(value):
     while text.endswith((".", "!", "?", "\"", "'")):
         text = text[:-1].strip()
     return text
-
-def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_new_tokens=64):
-    benchmark_path = Path(benchmark_path)
-    workspace_root = Path(workspace_root)
-    artifact_root = Path(artifact_root)
-    providers = []
-    for provider_name in ("openai", "siliconflow"):
-        profile = _provider_profile(provider_name)
-        if profile["status"] != "ready":
-            providers.append(profile)
-            continue
-        if provider_name == "openai":
-            def factory(task, workspace, profile=profile):
-                del task, workspace
-                return OpenAICompatibleModelClient(
-                    model=profile["model"],
-                    base_url=profile["base_url"],
-                    api_key=profile["api_key"],
-                    temperature=0.0,
-                    timeout=300,
-                )
-        else:
-            def factory(task, workspace, profile=profile):
-                del task, workspace
-                return SiliconflowModelClient(
-                    model=profile["model"],
-                    base_url=profile["base_url"],
-                    api_key=profile["api_key"],
-                    temperature=0.0,
-                    timeout=300,
-                )
-        artifact_path = artifact_root / f"{provider_name}-benchmark.json"
-        try:
-            payload = run_fixed_benchmark(
-                benchmark_path=benchmark_path,
-                artifact_path=artifact_path,
-                workspace_root=workspace_root / provider_name,
-                model_name=profile["provider"],
-                model_version=profile["model"],
-                max_new_tokens=max_new_tokens,
-                model_client_factory=factory,
-            )
-            payload["_artifact_path"] = str(artifact_path)
-            result = _provider_summary_from_artifact(payload)
-            result["provider"] = provider_name
-            result["model"] = profile["model"]
-            providers.append(result)
-        except Exception as exc:
-            providers.append(
-                {
-                    "provider": provider_name,
-                    "status": "error",
-                    "model": profile["model"],
-                    "reason": str(exc),
-                }
-            )
-    return {"providers": providers}
 
 def _followup_trace_metrics(agent):
     events = agent.run_store.load_trace_events(agent.current_task_state.run_id)
@@ -1340,76 +1255,6 @@ def render_resume_metrics_markdown(metrics):
             else:
                 lines.append(f"- {provider['provider']}: {provider['status']} ({provider.get('reason', 'unknown')})")
     lines.append("")
-    return "\n".join(lines)
-
-def render_large_scale_experiment_report(metrics):
-    benchmark = metrics["benchmark"]
-    memory_small = metrics["memory_base_experiment"]
-    memory_large = metrics["memory_large_experiment"]
-    context = metrics["context_experiment"]
-    security = metrics["security_experiment"]
-    providers = metrics.get("provider_experiments", {}).get("providers", [])
-    report_provider = (
-        metrics.get("real_provider")
-        or context.get("provider")
-        or memory_large.get("provider")
-        or security.get("provider")
-        or "unknown"
-    )
-    lines = [
-        "# Codini Large-Scale Experiment Report",
-        "",
-        "## Executive Summary",
-        (
-            f"- Experiment mode: real-model (provider: {report_provider})"
-            if metrics.get("experiment_mode") == "real"
-            else f"- Experiment mode: {metrics.get('experiment_mode', 'synthetic')}"
-        ),
-        f"- Fixed benchmark tasks: {benchmark['task_count']}",
-        f"- Large-scale memory tasks: {memory_large['task_count']}",
-        f"- Context stress configurations: {context['config_count']}",
-        f"- Security scenarios: {security['scenario_count']}",
-        "",
-        "## Context Governance",
-        (
-            f"- Real-model prompt chars ({report_provider}): {metrics['stress_ablation']['full']['prompt_chars']} vs {metrics['stress_ablation']['no_context_reduction']['prompt_chars']}"
-            if metrics.get("experiment_mode") == "real"
-            else f"- Synthetic stress prompt chars: {metrics['stress_ablation']['full']['prompt_chars']} vs {metrics['stress_ablation']['no_context_reduction']['prompt_chars']}"
-        ),
-        f"- Average prompt compression ratio across context matrix: {context['summary']['avg_prompt_compression_ratio']:.2%}",
-        f"- Max prompt compression ratio across context matrix: {context['summary']['max_prompt_compression_ratio']:.2%}",
-        "",
-        "## Memory Experiments",
-        f"- Small memory experiment repeated reads: {memory_small['memory_on']['repeated_reads']} vs {memory_small['memory_off']['repeated_reads']}",
-        f"- Large memory experiment repeated reads: {memory_large['variants']['memory_on']['repeated_reads']} vs {memory_large['variants']['memory_off']['repeated_reads']}",
-        f"- Large memory experiment avg tool steps: {memory_large['variants']['memory_on']['avg_tool_steps']:.2f} vs {memory_large['variants']['memory_off']['avg_tool_steps']:.2f}",
-        "",
-        "## Security Experiments",
-        f"- Security event counts: {json.dumps(security['security_event_counts'], sort_keys=True)}",
-        f"- Tool error code counts: {json.dumps(security['tool_error_code_counts'], sort_keys=True)}",
-        "",
-        "## Provider Experiments",
-    ]
-    if providers:
-        for provider in providers:
-            if provider.get("status") == "completed":
-                lines.append(
-                    f"- {provider['provider']}: pass_rate={provider['pass_rate']:.2%}, avg_attempts={provider['avg_attempts']:.2f}, avg_tool_steps={provider['avg_tool_steps']:.2f}, cache_hit_rate={provider['cache_hit_rate']:.2%}"
-                )
-            else:
-                lines.append(f"- {provider['provider']}: {provider['status']} ({provider.get('reason', 'unknown')})")
-    else:
-        lines.append("- none")
-    lines.extend(
-        [
-            "",
-            "## Resume-Safe Claims",
-            f"- Long-context stress scenario: prompt length reduced from {metrics['stress_ablation']['no_context_reduction']['prompt_chars']} to {metrics['stress_ablation']['full']['prompt_chars']}.",
-            f"- Large-scale memory experiment: repeated reads reduced from {memory_large['variants']['memory_off']['repeated_reads']} to {memory_large['variants']['memory_on']['repeated_reads']}.",
-            f"- Platform facts: {benchmark['task_count']} benchmark tasks, {metrics['facts']['tool_count']} tool types, {metrics['facts']['run_artifact_count']} run artifacts.",
-            "",
-        ]
-    )
     return "\n".join(lines)
 
 def _write_json_artifact(path, payload):
