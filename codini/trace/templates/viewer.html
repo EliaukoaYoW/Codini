@@ -167,7 +167,7 @@
     .execution-content { min-height: 0; flex: 1; display: flex; flex-direction: column; padding: 0 20px; overflow: hidden; }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(250px, 300px) minmax(130px, 170px) max-content;
+      grid-template-columns: minmax(250px, 300px) minmax(130px, 170px) minmax(0, 1fr);
       gap: 10px;
       align-items: center;
       margin-bottom: 17px;
@@ -257,7 +257,7 @@
     .search-wrap { padding: 0 12px; gap: 9px; }
     .search-wrap .icon { color: #8c7e73; }
     .search-wrap input { width: 100%; border: none; outline: none; background: transparent; color: #3d3732; }
-    .filters { display: flex; align-items: center; flex-wrap: nowrap; gap: 6px; min-width: 0; }
+    .filters { width: 100%; display: flex; align-items: center; flex-wrap: nowrap; gap: 6px; min-width: 0; }
     .filter-btn {
       height: 34px;
       padding: 0 10px;
@@ -272,6 +272,38 @@
     }
     .filter-btn:hover { background: #eef2f6; border-color: #cfd6df; }
     .filter-btn.active { border-color: #111827; color: #fff; background: #111827; }
+    .filter-btn.collapsed { display: none; }
+    .filter-overflow { position: relative; flex: 0 0 auto; }
+    .filter-overflow-btn { min-width: 36px; padding: 0 9px; font-size: 17px; line-height: 1; }
+    .filter-overflow-menu {
+      position: absolute;
+      z-index: 30;
+      top: calc(100% + 6px);
+      right: 0;
+      min-width: 126px;
+      padding: 5px;
+      border: 1px solid #c8cdd3;
+      border-radius: 9px;
+      background: var(--surface);
+      box-shadow: 0 10px 28px rgba(31, 27, 23, .16);
+      display: none;
+    }
+    .filter-overflow.open .filter-overflow-menu { display: grid; gap: 3px; }
+    .filter-menu-btn {
+      min-height: 32px;
+      padding: 0 10px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #425466;
+      text-align: left;
+      cursor: pointer;
+      font-size: 11.5px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .filter-menu-btn:hover { background: #eef2f6; }
+    .filter-menu-btn.active { color: #fff; background: #111827; }
     .stats {
       min-height: 80px;
       border: 1px solid var(--border);
@@ -460,6 +492,10 @@
             <button class="filter-btn" data-filter="subagent">Agents</button>
             <button class="filter-btn" data-filter="system">System</button>
             <button class="filter-btn" data-filter="error">Errors</button>
+            <div class="filter-overflow" id="filterOverflow" hidden>
+              <button class="filter-btn filter-overflow-btn" id="filterOverflowBtn" type="button" aria-label="更多筛选项" aria-expanded="false">…</button>
+              <div class="filter-overflow-menu" id="filterOverflowMenu" role="menu"></div>
+            </div>
           </div>
         </div>
         <div class="stats" id="stats"></div>
@@ -538,6 +574,62 @@
       toast.classList.add('show');
       clearTimeout(toastTimer);
       toastTimer = setTimeout(() => toast.classList.remove('show'), 1300);
+    }
+    function closeFilterOverflow() {
+      $('filterOverflow')?.classList.remove('open');
+      $('filterOverflowBtn')?.setAttribute('aria-expanded', 'false');
+    }
+    function selectFilter(nextFilter) {
+      filter = nextFilter || 'all';
+      document.querySelectorAll('#filters [data-filter]').forEach(item => {
+        item.classList.toggle('active', item.dataset.filter === filter);
+      });
+      closeFilterOverflow();
+      lastRendered.trace = '';
+      renderTrace();
+    }
+    function updateFilterOverflow() {
+      const filters = $('filters');
+      const overflow = $('filterOverflow');
+      const menu = $('filterOverflowMenu');
+      if (!filters || !overflow || !menu) return;
+
+      const buttons = Array.from(filters.querySelectorAll(':scope > .filter-btn[data-filter]'));
+      buttons.forEach(button => button.classList.remove('collapsed'));
+      overflow.hidden = true;
+      closeFilterOverflow();
+      menu.replaceChildren();
+
+      const gap = Number.parseFloat(getComputedStyle(filters).columnGap || getComputedStyle(filters).gap) || 0;
+      const fullWidth = buttons.reduce((total, button) => total + button.offsetWidth, 0)
+        + Math.max(0, buttons.length - 1) * gap;
+      if (fullWidth <= filters.clientWidth) return;
+
+      overflow.hidden = false;
+      let usedWidth = overflow.offsetWidth;
+      let collapsing = false;
+      const hiddenButtons = [];
+      buttons.forEach(button => {
+        const requiredWidth = button.offsetWidth + gap;
+        if (!collapsing && usedWidth + requiredWidth <= filters.clientWidth) {
+          usedWidth += requiredWidth;
+        } else {
+          collapsing = true;
+          button.classList.add('collapsed');
+          hiddenButtons.push(button);
+        }
+      });
+
+      hiddenButtons.forEach(button => {
+        const menuButton = document.createElement('button');
+        menuButton.type = 'button';
+        menuButton.className = 'filter-menu-btn';
+        menuButton.dataset.filter = button.dataset.filter;
+        menuButton.textContent = button.textContent;
+        menuButton.classList.toggle('active', button.dataset.filter === filter);
+        menuButton.setAttribute('role', 'menuitem');
+        menu.appendChild(menuButton);
+      });
     }
     async function copyText(text) {
       try { await navigator.clipboard.writeText(String(text ?? '')); }
@@ -1249,21 +1341,27 @@
         $('sessionPicker')?.classList.remove('open');
         $('sessionTrigger')?.setAttribute('aria-expanded', 'false');
       }
+      if (!event.target.closest('#filterOverflow')) closeFilterOverflow();
     });
     $('traceSearch').addEventListener('input', (event) => {
       query = event.target.value.trim().toLowerCase();
       lastRendered.trace = '';
       renderTrace();
     });
-    document.querySelectorAll('.filter-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('.filter-btn').forEach(item => item.classList.remove('active'));
-        btn.classList.add('active');
-        filter = btn.dataset.filter || 'all';
-        lastRendered.trace = '';
-        renderTrace();
-      });
+    $('filters').addEventListener('click', (event) => {
+      const overflowButton = event.target.closest('#filterOverflowBtn');
+      if (overflowButton) {
+        const overflow = $('filterOverflow');
+        const open = !overflow.classList.contains('open');
+        overflow.classList.toggle('open', open);
+        overflowButton.setAttribute('aria-expanded', String(open));
+        return;
+      }
+      const button = event.target.closest('[data-filter]');
+      if (button) selectFilter(button.dataset.filter);
     });
+    const filterResizeObserver = new ResizeObserver(updateFilterOverflow);
+    filterResizeObserver.observe($('filters'));
     document.querySelectorAll('.tab').forEach(tab => {
       tab.addEventListener('click', () => {
         document.querySelectorAll('.tab').forEach(item => item.classList.remove('active'));
@@ -1294,6 +1392,7 @@
       }
     }
     renderAll();
+    requestAnimationFrame(updateFilterOverflow);
     poll();
   </script>
 </body>
