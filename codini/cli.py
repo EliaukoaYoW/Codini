@@ -22,6 +22,8 @@ from .trace import make_trace
 
 from .slash import interactive_prompt
 
+from .mcp.client import connect_mcp_from_config
+
 try:
     from rich.console import Console, Group
     from rich.panel import Panel
@@ -451,30 +453,47 @@ def build_agent(args, trace=None):
             }
         )
     sandbox = create_sandbox(kind=args.sandbox, **sandbox_options)
-    if session_id:
-        return Codini.from_session(
-            model_client = model,
-            workspace = workspace,
-            session_store = store,
-            session_id = session_id,
-            approval_policy = args.approval,
-            max_steps = args.max_steps,
-            max_new_tokens = args.max_new_tokens,
-            secret_env_names = configured_secret_names,
-            sandbox = sandbox,
-            trace = trace,
-        )
-    return Codini(
-        model_client=model,
-        workspace=workspace,
-        session_store=store,
-        approval_policy=args.approval,
-        max_steps=args.max_steps,
-        max_new_tokens=args.max_new_tokens,
-        secret_env_names=configured_secret_names,
-        sandbox=sandbox,
-        trace=trace,
+    mcp_bridge, mcp_tool_index, mcp_model_tools = (
+        connect_mcp_from_config(enabled=not getattr(args, "no_mcp", False))
     )
+
+    mcp_kwargs = {
+        "mcp_bridge": mcp_bridge,
+        "mcp_tool_index": mcp_tool_index,
+        "mcp_model_tools": mcp_model_tools,
+    }
+
+    try:
+        if session_id:
+            return Codini.from_session(
+                model_client = model,
+                workspace = workspace,
+                session_store = store,
+                session_id = session_id,
+                approval_policy = args.approval,
+                max_steps = args.max_steps,
+                max_new_tokens = args.max_new_tokens,
+                secret_env_names = configured_secret_names,
+                sandbox = sandbox,
+                trace = trace,
+                **mcp_kwargs,
+            )
+        return Codini(
+            model_client=model,
+            workspace=workspace,
+            session_store=store,
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+            secret_env_names=configured_secret_names,
+            sandbox=sandbox,
+            trace=trace,
+            **mcp_kwargs,
+        )
+    except Exception:
+        if mcp_bridge is not None:
+            mcp_bridge.close()
+        raise
 
 def _get_skills_list(agent):
     skills_dir = agent.root / ".codini" / "skills"
@@ -506,6 +525,7 @@ def build_arg_parser():
     parser.add_argument("--timeout", type=int, default=300, help="Request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
+    parser.add_argument("--no-mcp", action="store_true", help="Disable optional remote MCP tools for this run.")
     parser.add_argument("--secret-env-name",dest="secret_env_names",action="append",default=[],help="Extra environment variable names to treat as secrets for trace/report redaction.",)
     parser.add_argument("--max-steps",type=int,default=6,help="Initial tool-step budget per request; successful progress can extend it to an internal hard limit.",)
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum model output tokens per step.")
@@ -538,172 +558,173 @@ def main(argv = None):
     trace = make_trace(console=console)
     try:
         agent = build_agent(args, trace=trace)
+        trace_server = None
+        trace_url = None
+        if args.trace_live:
+            from .trace.viewer import make_viewer_server
+            trace_server, trace_url = make_viewer_server(
+                agent.session.get("id", "latest"),
+                agent.root,
+                args.trace_host,
+                args.trace_port,
+                args.trace_poll_ms,
+            )
+            threading.Thread(target=trace_server.serve_forever, daemon=True).start()
+    
+        model = getattr(agent.model_client, "model", getattr(args, "model", ""))
+        host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", "")))
+    
+        if HAS_RICH:
+            build_welcome_rich(agent, model, host, trace_url, console=console)
+        else:
+            build_welcome(agent, model, host, trace_url)
+    
+        if args.prompt:
+            # 单次会话模式：只跑一次 ask，不进入 REPL 循环
+            prompt = " ".join(args.prompt).strip()
+            if prompt:
+                try:
+                    agent.ask(prompt)
+                except RuntimeError as e:
+                    if _agent_error_already_rendered(agent):
+                        return 1
+                    if trace:
+                        trace.on_run_error(str(e))
+                    else:
+                        print(str(e), file = sys.stderr)
+                    return 1
+            return 0
+    
+        # 初始化历史记录，如果从已有会话恢复则导入之前的用户输入历史
+        history = []
+        if agent.session and "history" in agent.session:
+            for item in agent.session["history"]:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    content = item.get("content")
+                    if content and (not history or history[-1] != content):
+                        history.append(content)
+    
+        while True:
+            # 交互模式
+            try:
+                if sys.stdin.isatty():
+                    skills = _get_skills_list(agent)
+                    user_input = interactive_prompt(
+                        prompt_text="\n\033[1;35mCodini\033[0m \033[1;33m>\033[0m ",
+                        commands_help=COMMANDS_HELP,
+                        common_models=[target.model for target in _configured_model_targets()],
+                        history=history,
+                        skills=skills
+                    ).strip()
+                elif HAS_RICH and console:
+                    user_input = console.input("\n[bold magenta]Codini[/] [bold yellow]>[/] ").strip()
+                else:
+                    user_input = input("\nCodini -> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                if trace_server is not None:
+                    trace_server.shutdown()
+                return 0
+    
+            if not user_input:
+                continue
+            if not history or history[-1] != user_input:
+                history.append(user_input)
+            if user_input in {"/exit"}:
+                if trace_server is not None:
+                    trace_server.shutdown()
+                return 0
+            if user_input == "/help":
+                print(HELP_DETAILS)
+                continue
+            if user_input == "/context":
+                try:
+                    _, metadata = agent.context_manager.build("")
+                    build_context_usage(metadata, console=console)
+                except Exception as e:
+                    print(f"Error calculating context: {e}", file=sys.stderr)
+                continue
+            if user_input == "/memory":
+                print(agent.memory_text())
+                continue
+            if user_input.startswith("/model"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2:
+                    try:
+                        target = _resolve_model_target(parts[1])
+                        current_provider = str(getattr(agent.model_client, "provider", ""))
+                        current_model = str(getattr(agent.model_client, "model", ""))
+                        if target.provider == current_provider and target.model == current_model:
+                            print(f"already using {target.model} ({target.provider})")
+                            continue
+                        new_client = _build_model_client(args,provider=target.provider,model=target.model,allow_base_url_override=False,)
+                        new_model = agent.switch_model(new_client)
+                        print(f"switched to {new_model} ({target.provider})")
+                    except (ValueError, RuntimeError) as exc:
+                        print(str(exc), file=sys.stderr)
+                else:
+                    current = getattr(agent.model_client, "model", "")
+                    current_provider = getattr(agent.model_client, "provider", "")
+                    print(f"current model: {current} ({current_provider})")
+                    print("available models:")
+                    targets = _configured_model_targets()
+                    if not targets:
+                        print("  (none configured)")
+                    model_counts = {}
+                    for target in targets:
+                        model_counts[target.model] = model_counts.get(target.model, 0) + 1
+                    for target in targets:
+                        marker = (
+                            "*"
+                            if target.model == current
+                            and target.provider == current_provider
+                            else "!" if model_counts[target.model] > 1 else " "
+                        )
+                        print(f"  {marker} {target.model} ({target.provider})")
+                    if any(count > 1 for count in model_counts.values()):
+                        print("  ! duplicate model name; switching requires a unique name")
+                    print("switch with: /model <name>")
+                continue
+            if user_input == "/reset":
+                agent.reset()
+                print("session reset")
+                continue
+            if user_input == "/session":
+                print(agent.session_path)
+                continue
+            if user_input == "/trace":
+                if trace_url:
+                    print(trace_url)
+                else:
+                    print("trace live viewer is inactive; restart without --no-trace-live")
+                continue
+            if user_input.startswith("/skill"):
+                from .tools import tool_list_skills, tool_read_skill
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2:
+                    skill_name = parts[1].strip()
+                    try:
+                        result = tool_read_skill(agent, {"name": skill_name})
+                        print(result)
+                    except ValueError as exc:
+                        print(str(exc), file=sys.stderr)
+                else:
+                    result = tool_list_skills(agent, {})
+                    print(result)
+                continue
+            try:
+                agent.ask(user_input)
+            except KeyboardInterrupt:
+                print("\n[interrupted]")
+                continue
+            except RuntimeError as exc:
+                if _agent_error_already_rendered(agent):
+                    continue
+                if trace:
+                    trace.on_run_error(str(exc))
+                else:
+                    print(str(exc), file=sys.stderr)
     except (ValueError, RuntimeError) as exc:
         parser.error(str(exc))
-    trace_server = None
-    trace_url = None
-    if args.trace_live:
-        from .trace.viewer import make_viewer_server
-        trace_server, trace_url = make_viewer_server(
-            agent.session.get("id", "latest"),
-            agent.root,
-            args.trace_host,
-            args.trace_port,
-            args.trace_poll_ms,
-        )
-        threading.Thread(target=trace_server.serve_forever, daemon=True).start()
-
-    model = getattr(agent.model_client, "model", getattr(args, "model", ""))
-    host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", "")))
-    # print(build_welcome(agent, model, host))
-
-    if HAS_RICH:
-        build_welcome_rich(agent, model, host, trace_url, console=console)
-    else:
-        build_welcome(agent, model, host, trace_url)
-
-    if args.prompt:
-        # 单次会话模式：只跑一次 ask，不进入 REPL 循环
-        prompt = " ".join(args.prompt).strip()
-        if prompt:
-            try:
-                agent.ask(prompt)
-            except RuntimeError as e:
-                if _agent_error_already_rendered(agent):
-                    return 1
-                if trace:
-                    trace.on_run_error(str(e))
-                else:
-                    print(str(e), file = sys.stderr)
-                return 1
-        return 0
-
-    # 初始化历史记录，如果从已有会话恢复则导入之前的用户输入历史
-    history = []
-    if agent.session and "history" in agent.session:
-        for item in agent.session["history"]:
-            if isinstance(item, dict) and item.get("role") == "user":
-                content = item.get("content")
-                if content and (not history or history[-1] != content):
-                    history.append(content)
-
-    while True:
-        # 交互模式
-        try:
-            if sys.stdin.isatty():
-                skills = _get_skills_list(agent)
-                user_input = interactive_prompt(
-                    prompt_text="\n\033[1;35mCodini\033[0m \033[1;33m>\033[0m ",
-                    commands_help=COMMANDS_HELP,
-                    common_models=[target.model for target in _configured_model_targets()],
-                    history=history,
-                    skills=skills
-                ).strip()
-            elif HAS_RICH and console:
-                user_input = console.input("\n[bold magenta]Codini[/] [bold yellow]>[/] ").strip()
-            else:
-                user_input = input("\nCodini -> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("")
-            if trace_server is not None:
-                trace_server.shutdown()
-            return 0
-
-        if not user_input:
-            continue
-        if not history or history[-1] != user_input:
-            history.append(user_input)
-        if user_input in {"/exit"}:
-            if trace_server is not None:
-                trace_server.shutdown()
-            return 0
-        if user_input == "/help":
-            print(HELP_DETAILS)
-            continue
-        if user_input == "/context":
-            try:
-                _, metadata = agent.context_manager.build("")
-                build_context_usage(metadata, console=console)
-            except Exception as e:
-                print(f"Error calculating context: {e}", file=sys.stderr)
-            continue
-        if user_input == "/memory":
-            print(agent.memory_text())
-            continue
-        if user_input.startswith("/model"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2:
-                try:
-                    target = _resolve_model_target(parts[1])
-                    current_provider = str(getattr(agent.model_client, "provider", ""))
-                    current_model = str(getattr(agent.model_client, "model", ""))
-                    if target.provider == current_provider and target.model == current_model:
-                        print(f"already using {target.model} ({target.provider})")
-                        continue
-                    new_client = _build_model_client(args,provider=target.provider,model=target.model,allow_base_url_override=False,)
-                    new_model = agent.switch_model(new_client)
-                    print(f"switched to {new_model} ({target.provider})")
-                except (ValueError, RuntimeError) as exc:
-                    print(str(exc), file=sys.stderr)
-            else:
-                current = getattr(agent.model_client, "model", "")
-                current_provider = getattr(agent.model_client, "provider", "")
-                print(f"current model: {current} ({current_provider})")
-                print("available models:")
-                targets = _configured_model_targets()
-                if not targets:
-                    print("  (none configured)")
-                model_counts = {}
-                for target in targets:
-                    model_counts[target.model] = model_counts.get(target.model, 0) + 1
-                for target in targets:
-                    marker = (
-                        "*"
-                        if target.model == current
-                        and target.provider == current_provider
-                        else "!" if model_counts[target.model] > 1 else " "
-                    )
-                    print(f"  {marker} {target.model} ({target.provider})")
-                if any(count > 1 for count in model_counts.values()):
-                    print("  ! duplicate model name; switching requires a unique name")
-                print("switch with: /model <name>")
-            continue
-        if user_input == "/reset":
-            agent.reset()
-            print("session reset")
-            continue
-        if user_input == "/session":
-            print(agent.session_path)
-            continue
-        if user_input == "/trace":
-            if trace_url:
-                print(trace_url)
-            else:
-                print("trace live viewer is inactive; restart without --no-trace-live")
-            continue
-        if user_input.startswith("/skill"):
-            from .tools import tool_list_skills, tool_read_skill
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2:
-                skill_name = parts[1].strip()
-                try:
-                    result = tool_read_skill(agent, {"name": skill_name})
-                    print(result)
-                except ValueError as exc:
-                    print(str(exc), file=sys.stderr)
-            else:
-                result = tool_list_skills(agent, {})
-                print(result)
-            continue
-        try:
-            agent.ask(user_input)
-        except KeyboardInterrupt:
-            print("\n[interrupted]")
-            continue
-        except RuntimeError as exc:
-            if _agent_error_already_rendered(agent):
-                continue
-            if trace:
-                trace.on_run_error(str(exc))
-            else:
-                print(str(exc), file=sys.stderr)
+    finally:
+        agent.close()
