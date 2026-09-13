@@ -63,6 +63,16 @@ BASE_TOOL_SPECS = {
         "schema": {"task": "str", "max_steps": "int=5"},
         "risky": True,
         "description": "Ask a bounded read-only sub agent to investigate."
+    },
+    "mcp_search_tools": {
+        "schema": {"query": "str", "limit": "int=5"},
+        "risky": False,
+        "description": "Search the private MCP capability catalog and activate a small ranked set of external tools for this task. Use when remote/current/account-specific data or an external action may be needed.",
+    },
+    "mcp_describe_tool": {
+        "schema": {"name": "str"},
+        "risky": False,
+        "description": "Load the schema and usage details for one canonical MCP tool returned by mcp_search_tools.",
     }
 }
 
@@ -75,7 +85,9 @@ TOOL_EXAMPLES = {
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":5}}</tool>',
     "list_skills": '<tool>{"name":"list_skills","args":{}}</tool>',
-    "read_skill": '<tool>{"name":"read_skill","args":{"name":"copyright_generator"}}</tool>'
+    "read_skill": '<tool>{"name":"read_skill","args":{"name":"copyright_generator"}}</tool>',
+    "mcp_search_tools": '<tool>{"name":"mcp_search_tools","args":{"query":"official Microsoft authentication documentation","limit":5}}</tool>',
+    "mcp_describe_tool": '<tool>{"name":"mcp_describe_tool","args":{"name":"mcp__microsoft-learn__microsoft_docs_search"}}</tool>',
 }
 
 
@@ -93,6 +105,8 @@ def build_tool_registry(agent):
         name: {**spec, "run": partial(_TOOL_RUNNERS[name], agent)}
         for name, spec in BASE_TOOL_SPECS.items()
         if name != "delegate" or agent.depth < agent.max_depth
+        if not name.startswith("mcp_") or getattr(agent, "mcp_router", None) is not None
+        if not name.startswith("mcp_") or agent.mcp_router.enabled
     }
     return tools
 
@@ -199,6 +213,23 @@ def validate_tool_schema(name, args):
 
         if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
             raise ToolSchemaError("invalid skill name")
+
+    if name == "mcp_search_tools":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ToolSchemaError("query must not be empty")
+        try:
+            limit = int(args.get("limit", 5))
+        except (TypeError, ValueError) as exc:
+            raise ToolSchemaError("limit must be an integer") from exc
+        if limit < 1 or limit > 20:
+            raise ToolSchemaError("limit must be between 1 and 20")
+        return
+
+    if name == "mcp_describe_tool":
+        tool_name = str(args.get("name", "")).strip()
+        if not tool_name:
+            raise ToolSchemaError("name must not be empty")
         return
 
 
@@ -491,6 +522,14 @@ def tool_read_skill(agent, args):
     raise ValueError(f"SKILL '{raw_name}' not found. Use list_skills to see available skills.")
 
 
+def tool_mcp_search_tools(agent, args):
+    return agent.search_mcp_tools(args)
+
+
+def tool_mcp_describe_tool(agent, args):
+    return agent.describe_mcp_tool(args)
+
+
 
 
 _TOOL_RUNNERS = {
@@ -502,5 +541,7 @@ _TOOL_RUNNERS = {
     "patch_file": tool_patch_file,
     "list_skills": tool_list_skills,
     "read_skill": tool_read_skill,
-    "delegate": tool_delegate
+    "delegate": tool_delegate,
+    "mcp_search_tools": tool_mcp_search_tools,
+    "mcp_describe_tool": tool_mcp_describe_tool,
 }
