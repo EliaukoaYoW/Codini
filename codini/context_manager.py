@@ -1,7 +1,7 @@
 """
 Prompt 组装与上下文预算控制。
 
-这个模块负责决定：每一轮到底把多少 prefix、memory、相关笔记、历史
+这个模块负责决定：每一轮到底把多少 prefix、working_memory、相关笔记、历史
 以及当前用户请求送进模型。
 """
 
@@ -15,7 +15,7 @@ from typing import Any
 DEFAULT_TOTAL_BUDGET = 25000  # 整个 Prompt 允许的最大字符数
 DEFAULT_SECTION_BUDGET_RATIOS = {
     "prefix": 0.25,          # 系统指令 + 工作区快照
-    "memory": 0.15,          # 工作记忆（任务摘要 + 最近读过的文件）
+    "working_memory": 0.15,          # 工作记忆（任务摘要 + 最近读过的文件）
     "relevant_memory": 0.10, # 根据当前请求召回的相关历史笔记
     "history": 0.50,         # 本次会话的历史记录
 }
@@ -46,19 +46,19 @@ DEFAULT_SECTION_BUDGETS = section_budgets_for_total(DEFAULT_TOTAL_BUDGET)
 # 每个部分的最小预算，防止模型输出为空
 DEFAULT_SECTION_FLOORS = {
     "prefix": 2400,
-    "memory": 800,
+    "working_memory": 800,
     "relevant_memory": 800,
     "history": 3000
 }
 # 当 Prompt 超预算时的压缩顺序
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
+DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "working_memory", "prefix")
 # 拼接 Prompt 时各 Section 的排列顺序（从上到下）
-SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request")
+SECTION_ORDER = ("prefix", "working_memory", "relevant_memory", "history", "current_request")
 CURRENT_REQUEST_SECTION = "current_request"  # 当前用户的请求环节
 RELEVANT_MEMORY_LIMIT = 3                    # 最多召回 3 条相关历史笔记
 DEFAULT_SECTION_WEIGHTS = {
     "prefix": 4.0,
-    "memory": 2.0,
+    "working_memory": 2.0,
     "relevant_memory": 1.0,
     "history": 2.0,
 }
@@ -141,7 +141,7 @@ class SectionRender:
 class ContextManager:
     """ 
     上下文管理器 负责根据预算组装 Prompt 
-    组装顺序: prefix -> memory -> relevant_memory -> history -> current_request
+    组装顺序: prefix -> working_memory -> relevant_memory -> history -> current_request
     """
     def __init__(
         self,
@@ -194,7 +194,7 @@ class ContextManager:
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
-            "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
+            "working_memory": "Working Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}"
         }
@@ -203,6 +203,11 @@ class ContextManager:
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
             section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+        # Recovery restrictions must survive history/prefix compression and disabled memory.
+        recovery_text = (self.agent.render_tool_recovery_text()
+                         if hasattr(self.agent, "render_tool_recovery_text") else "")
+        if recovery_text:
+            section_texts[CURRENT_REQUEST_SECTION] += "\n\n" + recovery_text
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit = RELEVANT_MEMORY_LIMIT)
@@ -266,10 +271,7 @@ class ContextManager:
             if not reduced:
                 break
         allocation["allocated_chars"] = dict(budgets)
-        allocation["unused_chars"] = max(
-            0,
-            int(allocation["available_chars"]) - sum(budgets.values()),
-        )
+        allocation["unused_chars"] = max(0, int(allocation["available_chars"]) - sum(budgets.values()))
         metadata = self._metadata(
             prompt = prompt,
             rendered = rendered,
@@ -301,7 +303,7 @@ class ContextManager:
         history_raw = self._raw_history_text(history)
         return {
             "prefix": SectionRender(raw = section_texts["prefix"], budget = len(section_texts["prefix"]), rendered = section_texts["prefix"], details = {}),
-            "memory": SectionRender(raw = section_texts["memory"], budget = len(section_texts["memory"]), rendered = section_texts["memory"], details = {}),
+            "working_memory": SectionRender(raw = section_texts["working_memory"], budget = len(section_texts["working_memory"]), rendered = section_texts["working_memory"], details = {}),
             "relevant_memory": SectionRender(
                 raw = relevant_raw,
                 budget = len(relevant_raw),
@@ -352,7 +354,7 @@ class ContextManager:
         history = list(getattr(self.agent, "session", {}).get("history", []))
         raw_sections = {
             "prefix": section_texts["prefix"],
-            "memory": section_texts["memory"],
+            "working_memory": section_texts["working_memory"],
             "relevant_memory": self._relevant_memory_raw(selected_notes),
             "history": self._raw_history_text(history),
         }
@@ -415,7 +417,7 @@ class ContextManager:
         history = list(getattr(self.agent, "session", {}).get("history", []))
         raw_sections = {
             "prefix": section_texts["prefix"],
-            "memory": section_texts["memory"],
+            "working_memory": section_texts["working_memory"],
             "relevant_memory": relevant_raw,
             "history": self._raw_history_text(history),
         }
@@ -461,8 +463,8 @@ class ContextManager:
             weights["history"] += 3.0
             signals["history"].append("continuation_request")
         if WORKING_MEMORY_PATTERN.search(user_message):
-            weights["memory"] += 2.0
-            signals["memory"].append("workspace_task")
+            weights["working_memory"] += 2.0
+            signals["working_memory"].append("workspace_task")
         signals["prefix"].append("protected_core")
 
         budgets = {section: 0 for section in sections}
@@ -558,7 +560,7 @@ class ContextManager:
                 # 历史记录 -> 有独立的渲染逻辑
                 rendered[section] = self._render_history_section(int(budget or 0))
             else:
-                # prefix 和 memory 直接裁剪
+                # prefix 和 working_memory 直接裁剪
                 raw = section_texts[section]
                 rendered_text = _tail_clip(raw, max(0, int(budget or 0)))
                 rendered[section] = SectionRender(raw = raw, budget = int(budget or 0),  rendered = rendered_text, details = {})
@@ -761,7 +763,8 @@ class ContextManager:
                     }
                 )
                 continue
-            if item["role"] == "tool" and item["name"] == "read_file":
+            if (item["role"] == "tool" and item["name"] == "read_file"
+                    and item.get("status") not in {"started", "interrupted", "error"}):
                 path = str(item["args"].get("path", "")).strip()
                 if path in seen_older_reads:
                     details["collapsed_duplicate_reads"] += 1
@@ -868,7 +871,7 @@ class ContextManager:
         return "\n\n".join(
             [
                 rendered["prefix"].rendered,
-                rendered["memory"].rendered,
+                rendered["working_memory"].rendered,
                 rendered["relevant_memory"].rendered,
                 rendered["history"].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
@@ -879,7 +882,7 @@ class ContextManager:
         return "\n\n".join(
             [
                 rendered["prefix"].rendered,
-                rendered["memory"].rendered,
+                rendered["working_memory"].rendered,
                 rendered["relevant_memory"].rendered,
                 rendered["history"].rendered,
             ]

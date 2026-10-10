@@ -8,10 +8,97 @@
 import os
 import re
 import shutil
+import signal
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def _stop_process(process):
+    """Stop the reachable process group; do not claim containment of descendants."""
+    report = {"resource": "process", "pid": process.pid,
+              "local_cleanup_confirmed": False, "process_group_exit_confirmed": False,
+              "cleanup_scope": "process_tree" if os.name == "nt" else "process_group",
+              "cleanup_errors": []}
+    try:
+        if os.name == "nt":
+            # Do not terminate the parent first: taskkill needs it to find children.
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "taskkill could not confirm tree termination")
+            process.wait(timeout=3)
+        else:
+            # ponytail: process groups cannot contain descendants that call setsid;
+            # use the Docker sandbox for commands requiring stronger containment.
+            def group_alive():
+                process.poll()  # Reap the direct child before probing its group.
+                try:
+                    os.killpg(process.pid, 0)
+                    return True
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    return True  # An inaccessible group is not confirmed gone.
+
+            for sig, grace in ((signal.SIGTERM, 1), (signal.SIGKILL, 3)):
+                try:
+                    os.killpg(process.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                deadline = time.monotonic() + grace
+                while group_alive() and time.monotonic() < deadline:
+                    try:
+                        time.sleep(0.05)
+                    except KeyboardInterrupt:
+                        break  # Escalate; do not abandon cleanup.
+                if not group_alive():
+                    break
+            if group_alive():
+                raise TimeoutError(f"process group {process.pid} has not exited")
+            process.wait(timeout=1)
+        report["process_group_exit_confirmed"] = True
+        report["cleanup_limitations"] = [
+            "Detached descendants are not contained; verify they stopped before resuming writes."
+        ]
+    except (Exception, KeyboardInterrupt) as exc:
+        report["cleanup_errors"].append(str(exc) or "cleanup interrupted")
+    return report
+
+
+def _run_process(command, *, timeout, **kwargs):
+    """Shared subprocess boundary for all sandbox commands."""
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        **kwargs,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except BaseException as exc:
+        exc.cleanup_report = _stop_process(process)
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+
+def _timeout_result(exc, timeout):
+    report = getattr(exc, "cleanup_report", {})
+    if not report.get("local_cleanup_confirmed"):
+        error = RuntimeError(f"sandbox: command timed out; cleanup unconfirmed: {report}")
+        error.cleanup_report = report
+        raise error from exc
+    return SandboxResult(-1, "", f"sandbox: command timed out after {timeout}s; local cleanup confirmed")
 
 
 @dataclass
@@ -50,23 +137,15 @@ class NoSandbox(Sandbox):
         输出：SandboxResult。
         """
         try:
-            result = subprocess.run(
+            result = _run_process(
                 command,
                 cwd=cwd,
                 shell=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=timeout,
                 env=env,
             )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(
-                returncode=-1,
-                stdout="",
-                stderr=f"sandbox: command timed out after {timeout}s",
-            )
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(exc, timeout)
         return SandboxResult(
             returncode=result.returncode,
             stdout=result.stdout.strip(),
@@ -110,22 +189,14 @@ class BubblewrapSandbox(Sandbox):
         输出：SandboxResult。"""
         cmd = self._build_command(command, cwd, env)
         try:
-            result = subprocess.run(
+            result = _run_process(
                 cmd,
                 cwd=cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=timeout,
                 env=env,  # bwrap 内部用 --clearenv + --setenv 控制
             )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(
-                returncode=-1,
-                stdout="",
-                stderr=f"sandbox: command timed out after {timeout}s",
-            )
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(exc, timeout)
         return SandboxResult(
             returncode=result.returncode,
             stdout=result.stdout.strip(),
@@ -283,26 +354,44 @@ class DockerSandbox(Sandbox):
             env,
             container_name=container_name,
         )
+        creation_complete = False
+        deadline = time.monotonic() + timeout
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                env=process_env,
-            )
-        except subprocess.TimeoutExpired:
-            self._remove_container(container_name, process_env)
-            return SandboxResult(
-                returncode=-1,
-                stdout="",
-                stderr=f"sandbox: command timed out after {timeout}s",
-            )
-        except BaseException:
-            self._remove_container(container_name, process_env)
+            # Create cannot execute user code. Cancellation during create must
+            # never race with a later start issued by the same docker run command.
+            result = _run_process(cmd, timeout=timeout, env=process_env)
+            creation_complete = True
+            if result.returncode == 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error = subprocess.TimeoutExpired(cmd, timeout)
+                    error.cleanup_report = {"local_cleanup_confirmed": True}
+                    raise error
+                result = _run_process(
+                    [self.docker_executable, "start", "--attach", container_name],
+                    timeout=remaining, env=process_env,
+                )
+        except BaseException as exc:
+            process_report = getattr(exc, "cleanup_report", {})
+            try:
+                self._remove_container(container_name, process_env)
+                cleanup_errors = []
+            except (Exception, KeyboardInterrupt) as cleanup_error:
+                cleanup_errors = [str(cleanup_error) or "container cleanup interrupted"]
+            if not creation_complete:
+                cleanup_errors.append("create did not finish; a late-created stopped container may remain")
+            exc.cleanup_report = {
+                "resource": "docker", "container_name": container_name,
+                "cleanup_scope": "container",
+                "local_cleanup_confirmed": bool(process_report.get("process_group_exit_confirmed")
+                    or process_report.get("local_cleanup_confirmed"))
+                    and not cleanup_errors,
+                "cleanup_errors": process_report.get("cleanup_errors", []) + cleanup_errors,
+            }
+            if isinstance(exc, subprocess.TimeoutExpired):
+                return _timeout_result(exc, timeout)
             raise
+        self._remove_container(container_name, process_env)
         return SandboxResult(
             returncode=result.returncode,
             stdout=result.stdout.strip(),
@@ -319,8 +408,7 @@ class DockerSandbox(Sandbox):
 
         args = [
             self.docker_executable,
-            "run",
-            "--rm",
+            "create",
             "--name",
             container_name,
             "--init",
@@ -362,17 +450,28 @@ class DockerSandbox(Sandbox):
 
     def _remove_container(self, container_name, process_env):
         try:
-            subprocess.run(
+            result = _run_process(
                 [self.docker_executable, "rm", "-f", container_name],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
+                timeout=5,
                 env=process_env,
             )
-        except (OSError, subprocess.SubprocessError):
-            pass
+            # Verify absence even if rm failed: --rm/another cleanup may have
+            # removed it already. A daemon failure must not look like absence.
+            remaining = _run_process(
+                [self.docker_executable, "container", "ls", "--all", "--quiet",
+                 "--filter", f"name=^/{container_name}$"],
+                timeout=5, env=process_env,
+            )
+            if remaining.returncode != 0 or remaining.stdout.strip():
+                raise RuntimeError(remaining.stderr.strip() or result.stderr.strip()
+                                   or "container still exists")
+        except (Exception, KeyboardInterrupt) as exc:
+            exc.cleanup_report = {
+                "resource": "docker", "container_name": container_name,
+                "local_cleanup_confirmed": False,
+                "cleanup_errors": [str(exc) or "container cleanup interrupted"],
+            }
+            raise
 
 
 def create_sandbox(kind="none", **kwargs):

@@ -134,13 +134,22 @@ class SpanScope:
         return self.span
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        status = "OK"
-        if exc_type:
+        if exc_type is None:
+            status = "OK"
+        elif issubclass(exc_type, KeyboardInterrupt):
+            status = "CANCELLED"
+            self.span.set_attribute("interrupted", True)
+        else:
             status = "ERROR"
             self.span.set_attribute("error", str(exc_val))
-        self.span.finish(status=status)
-        self.tracer._active_span_var.reset(self.token)
+        try:
+            self.span.finish(status=status)
+        finally:
+            self.tracer._active_span_var.reset(self.token)
 
+        # 不吞掉异常，让 ask() 继续处理。
+        return False
+        
 
 class FileSpanExporter(SpanProcessor):
     def __init__(self, agent):
@@ -284,6 +293,11 @@ class FileSpanExporter(SpanProcessor):
                 "affected_paths": span.attributes.get("affected_paths"),
                 "tool_status": span.attributes.get("tool_status"),
                 "tool_error_code": span.attributes.get("tool_error_code"),
+                "tool_call_id": span.attributes.get("tool_call_id"),
+                "cleanup_report": span.attributes.get("cleanup_report"),
+                "result_known": span.attributes.get("result_known"),
+                "requires_review": span.attributes.get("requires_review"),
+                "workspace_observation_stable": span.attributes.get("workspace_observation_stable"),
                 "child_session_id": span.attributes.get("child_session_id"),
                 "child_run_id": span.attributes.get("child_run_id"),
                 "child_trace_id": span.attributes.get("child_trace_id"),
