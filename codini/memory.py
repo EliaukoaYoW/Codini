@@ -835,7 +835,7 @@ def retrieval_view(state, query, limit=3, workspace_root=None):
 def render_memory_text(state, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
     lines = [
-        "Memory:",
+        "Working Memory:",
         f"- task: {state['working']['task_summary'] or '-'}",
         f"- recent_files: {', '.join(state['working']['recent_files']) or '-'}",
     ]

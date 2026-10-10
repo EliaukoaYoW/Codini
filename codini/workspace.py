@@ -100,7 +100,7 @@ class WorkspaceContext:
         )
     
     def text(self):
-        # 这段文本会被塞进 Prompt Prefix 作为相对稳定的基线上下文
+        """ 这段文本会被塞进 Prompt Prefix 作为相对稳定的基线上下文 """
         commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
         docs = "\n".join(f"- {path}\n{snippet}" for path,snippet in self.project_docs.items()) or "- none"
         text = textwrap.dedent(

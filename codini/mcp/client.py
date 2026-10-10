@@ -11,9 +11,10 @@ import json
 import os
 import re
 import threading
+import time
 import warnings
 from collections import Counter
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
@@ -21,7 +22,8 @@ from types import SimpleNamespace
 
 import httpx
 from mcp.client.streamable_http import streamable_http_client
-from mcp import ClientSession
+from mcp import ClientSession, types
+from mcp.shared.exceptions import McpError
 
 from .routing import normalize_routing_config
 
@@ -418,6 +420,33 @@ def connect_mcp_from_config(path=None, *, enabled=True):
         )
         return EMPTY_MCP_BUNDLE
 
+class CancellableClientSession(ClientSession):
+    async def send_request(self, request, result_type, *args, **kwargs):
+        # MCP 1.x reserves this ID synchronously before its first await. Keep the
+        # dependency-specific access here and verify it against the real SDK.
+        request_id = self._request_id
+        try:
+            return await super().send_request(request, result_type, *args, **kwargs)
+        except (asyncio.CancelledError, McpError) as exc:
+            if isinstance(exc, McpError) and exc.error.code != httpx.codes.REQUEST_TIMEOUT:
+                raise
+            report = {"resource": "mcp", "remote_outcome": "unknown",
+                      "cancellation_notification_sent": False, "cleanup_errors": []}
+            if request.root.method != "initialize":
+                try:
+                    await asyncio.wait_for(self.send_notification(types.ClientNotification(
+                        types.CancelledNotification(params=types.CancelledNotificationParams(
+                            requestId=request_id, reason="Codini request cancelled or timed out",
+                        ))
+                    )), timeout=2)
+                    # This confirms delivery to the transport, not server termination.
+                    report["cancellation_notification_sent"] = True
+                except (Exception, asyncio.CancelledError) as notification_error:
+                    report["cleanup_errors"].append(str(notification_error) or "notification cancelled")
+            exc.cleanup_report = report
+            raise
+
+
 class RemoteMCPClient:
     def __init__(
             self,
@@ -448,7 +477,7 @@ class RemoteMCPClient:
             )
         )
         self.session = await self.exit_stack.enter_async_context(
-            ClientSession(
+            CancellableClientSession(
                 read,
                 write,
                 read_timeout_seconds=timedelta(
@@ -522,6 +551,9 @@ class MCPBridge:
         self.lifecycle_closed = threading.Event()
         self.start_error = None
         self.close_error = None
+        self._pending_call = None
+        self.cleanup_timeout_seconds = 5
+        self._transport_reset_required = False
 
     def _run_loop(self):
         # 1. 为当前子线程创建一个全新的、独立的事件循环
@@ -576,8 +608,18 @@ class MCPBridge:
 
         if self.start_error is not None:
             raise RuntimeError("MCP 连接建立失败") from self.start_error
+        self._transport_reset_required = False
 
     def _submit(self, coroutine):
+        if self._transport_reset_required:
+            try:
+                # Never reuse a session whose transport was cancelled. close()
+                # also refuses to proceed if its previous cleanup is incomplete.
+                self.close()
+                self.start()
+            except BaseException:
+                coroutine.close()
+                raise
         if self.loop is None:
             coroutine.close()
             raise RuntimeError("MCP Bridge 尚未启动")
@@ -586,17 +628,101 @@ class MCPBridge:
             coroutine.close()
             raise RuntimeError("MCP Bridge 线程没有运行")
             
-        # 主线程/同步函数中调用异步协程并等待结果：
-        future = asyncio.run_coroutine_threadsafe(
-            coroutine,
-            self.loop,
-        )
+        if self._pending_call is not None and not self._pending_call["done"].is_set():
+            coroutine.close()
+            raise RuntimeError("Previous MCP request has not finished cleanup")
+        call = {"done": threading.Event(), "cancel": threading.Event(),
+                "future": Future(), "task": None,
+                "report": {"resource": "mcp", "remote_outcome": "unknown"}}
+        self._pending_call = call
+
+        def finished(task):
+            try:
+                result = task.result()
+            except BaseException as exc:
+                call["report"].update(getattr(exc, "cleanup_report", {}))
+                call["report"]["request_cleanup_confirmed"] = True
+                call["report"]["local_cleanup_confirmed"] = self.lifecycle_future is None
+                if isinstance(exc, asyncio.CancelledError) or hasattr(exc, "cleanup_report"):
+                    exc.cleanup_report = dict(call["report"])
+                call["done"].set()
+                call["future"].set_exception(exc)
+            else:
+                # Task completion, including async finally blocks; a cancelled
+                # concurrent Future alone cannot establish this fact.
+                call["done"].set()
+                call["future"].set_result(result)
+
+        def start():
+            task = self.loop.create_task(coroutine)
+            call["task"] = task
+            task.add_done_callback(finished)
+            if call["cancel"].is_set():
+                call["cancel_sent"] = True
+                task.cancel()
 
         try:
-            return future.result(timeout=self.request_timeout_seconds)
+            self.loop.call_soon_threadsafe(start)
+            return call["future"].result(timeout=self.request_timeout_seconds)
+        except KeyboardInterrupt as exc:
+            exc.cleanup_report = self._cancel_call(call)
+            raise
         except FutureTimeoutError as exc:
-            future.cancel()
-            raise TimeoutError("MCP 工具调用超时") from exc
+            if call["future"].done():
+                if hasattr(exc, "cleanup_report"):
+                    exc.cleanup_report = self._cancel_call(call)
+                raise
+            report = self._cancel_call(call)
+            error = TimeoutError("MCP 工具调用超时" + (
+                "；本地清理尚未完成" if not report["local_cleanup_confirmed"] else ""
+            ))
+            error.cleanup_report = report
+            raise error from exc
+        except Exception as exc:
+            # SDK read timeouts arrive as McpError, before the bridge deadline.
+            if hasattr(exc, "cleanup_report"):
+                exc.cleanup_report = self._cancel_call(call)
+            raise
+
+    def _cancel_call(self, call):
+        def cancel():
+            if (call["task"] is not None and not call["task"].done()
+                    and not call.get("cancel_sent")):
+                call["cancel_sent"] = True
+                call["task"].cancel()
+
+        if not call["cancel"].is_set():
+            call["cancel"].set()
+            self.loop.call_soon_threadsafe(cancel)
+        deadline = time.monotonic() + self.cleanup_timeout_seconds
+        while not call["done"].is_set() and time.monotonic() < deadline:
+            try:
+                call["done"].wait(min(0.05, max(0, deadline - time.monotonic())))
+            except KeyboardInterrupt:
+                # A second Ctrl+C must not interrupt the task's async cleanup.
+                continue
+        report = dict(call["report"])
+        report["request_cleanup_confirmed"] = call["done"].is_set()
+        report["transport_cleanup_confirmed"] = self.lifecycle_future is None
+        if self.lifecycle_future is not None:
+            self._transport_reset_required = True
+            if call["done"].is_set():
+                self.loop.call_soon_threadsafe(self.shutdown_event.set)
+                while not self.lifecycle_closed.is_set() and time.monotonic() < deadline:
+                    try:
+                        self.lifecycle_closed.wait(min(0.05, max(0, deadline - time.monotonic())))
+                    except KeyboardInterrupt:
+                        continue
+                report["transport_cleanup_confirmed"] = (
+                    self.lifecycle_closed.is_set() and self.close_error is None
+                )
+                if self.close_error is not None:
+                    report.setdefault("cleanup_errors", []).append(str(self.close_error))
+        report["local_cleanup_confirmed"] = (
+            report["request_cleanup_confirmed"] and report["transport_cleanup_confirmed"]
+        )
+        call["report"].update(report)
+        return report
 
     def list_tools(self):
         return self._submit(
@@ -646,7 +772,16 @@ class MCPBridge:
 
     def close(self):
         if self.loop is None:
+            if self.close_error is not None:
+                raise RuntimeError("MCP session cleanup failed") from self.close_error
             return
+
+        if self._pending_call is not None and not self._pending_call["done"].is_set():
+            report = self._cancel_call(self._pending_call)
+            if not report["local_cleanup_confirmed"]:
+                error = TimeoutError("MCP request cleanup is still running")
+                error.cleanup_report = report
+                raise error
 
         loop = self.loop
         thread = self.thread

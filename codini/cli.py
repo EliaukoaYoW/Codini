@@ -65,6 +65,8 @@ HELP_DETAILS = textwrap.dedent(
     /model   Show or switch to a model configured in the environment.
     /memory  Show the agent's distilled working memory.
     /reset   Clear the current session history and memory.
+    /resolve-tool [id outcome evidence]  List or resolve interrupted writes after verifying they stopped.
+        Outcomes: completed, not-applied, partial. Evidence is required; this does not execute a retry.
     /skill   List all available skills or read a specific skill.
     /session Show the path to the saved session file.
     /trace   Show the live trace viewer URL for the current session.
@@ -83,6 +85,7 @@ COMMANDS_HELP = {
     "/memory": "Show the agent's distilled working memory.",
     "/session": "Show the path to the saved session file.",
     "/reset": "Clear the current session history and memory.",
+    "/resolve-tool": "List or resolve interrupted tools after verifying stopped execution and its outcome.",
     "/skill": "List all available skills or read a specific skill.",
     "/exit": "Exit the agent."
 }
@@ -605,7 +608,6 @@ def main(argv = None):
                         history.append(content)
     
         while True:
-            # 交互模式
             try:
                 if sys.stdin.isatty():
                     skills = _get_skills_list(agent)
@@ -685,9 +687,32 @@ def main(argv = None):
                         print("  ! duplicate model name; switching requires a unique name")
                     print("switch with: /model <name>")
                 continue
+            if user_input == "/resolve-tool" or user_input.startswith("/resolve-tool "):
+                parts = user_input.split(maxsplit=3)
+                try:
+                    if len(parts) == 1:
+                        pending = agent.unresolved_tool_calls()
+                        for entry in pending:
+                            print(entry["tool_call_id"], entry["name"], entry["status"])
+                            print("  args:", entry["args"])
+                            print("  cleanup:", entry.get("cleanup_report", {}))
+                        print("Verify execution has stopped and check its effects, then use:\n"
+                              "/resolve-tool <id> <completed|not-applied|partial> <evidence>"
+                              if pending else "No unresolved tool calls.")
+                    elif len(parts) == 4:
+                        agent.resolve_interrupted_tool(parts[1], parts[2], parts[3])
+                        print("tool outcome recorded; no retry executed")
+                    else:
+                        raise ValueError("Usage: /resolve-tool <id> <completed|not-applied|partial> <evidence>")
+                except (ValueError, OSError) as exc:
+                    print(agent.redact_text(str(exc)), file=sys.stderr)
+                continue
             if user_input == "/reset":
-                agent.reset()
-                print("session reset")
+                try:
+                    agent.reset()
+                    print("session reset")
+                except ValueError as exc:
+                    print(str(exc), file=sys.stderr)
                 continue
             if user_input == "/session":
                 print(agent.session_path)
@@ -714,8 +739,19 @@ def main(argv = None):
                 continue
             try:
                 agent.ask(user_input)
-            except KeyboardInterrupt:
+            except KeyboardInterrupt as exc:
                 print("\n[interrupted]")
+                cleanup = getattr(exc, "cleanup_report", {})
+                if cleanup:
+                    print("[local cleanup confirmed]" if cleanup.get("local_cleanup_confirmed")
+                          else "[local cleanup unconfirmed]")
+                    if cleanup.get("remote_outcome") == "unknown":
+                        label = "model" if cleanup.get("resource") == "model_http" else "MCP"
+                        print(f"[{label} remote execution outcome unknown]")
+                    for limitation in cleanup.get("cleanup_limitations", []):
+                        print(agent.redact_text(str(limitation)), file=sys.stderr)
+                    for error in cleanup.get("cleanup_errors", []):
+                        print(agent.redact_text(str(error)), file=sys.stderr)
                 continue
             except RuntimeError as exc:
                 if _agent_error_already_rendered(agent):

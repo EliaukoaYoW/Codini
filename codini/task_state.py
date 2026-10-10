@@ -25,6 +25,14 @@ STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_STOPPED = "stopped"
 STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
+
+TERMINAL_STATUSES = frozenset({
+    STATUS_COMPLETED,
+    STATUS_STOPPED,
+    STATUS_FAILED,
+    STATUS_CANCELLED,
+})
 
 STOP_REASON_FINAL_ANSWER_RETURNED = "final_answer_returned"
 STOP_REASON_STEP_LIMIT_REACHED = "step_limit_reached"
@@ -37,6 +45,7 @@ STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
 STOP_REASON_RUNTIME_ERROR = "runtime_error"
+STOP_REASON_USER_CANCELLED = "user_cancelled"
 
 
 @dataclass
@@ -142,6 +151,11 @@ class TaskState:
         }
         return cls(**base)
 
+    @property
+    def is_terminal(self):
+        """本轮运行是否已经结束。"""
+        return self.status in TERMINAL_STATUSES
+
     def record_attempt(self):
         # attempt 统计的是"模型被调用了几轮"，不等于 tool_steps。
         self.attempts += 1
@@ -154,11 +168,43 @@ class TaskState:
 
     def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
         # stop_reason 和 status 分开存，是为了区分"怎么停的"和"停下时是什么状态"。
+        if status not in TERMINAL_STATUSES:
+            raise ValueError(f"Invalid terminal status: {status}")
+
+        if not isinstance(stop_reason, str) or not stop_reason.strip():
+            raise ValueError("stop_reason must be a non-empty string")
+
+        stop_reason = stop_reason.strip()
+        final_answer = str(final_answer)
+
+        if self.is_terminal:
+            same_outcome = (
+                self.status == status
+                and self.stop_reason == stop_reason
+                and (
+                    final_answer == ""
+                    or final_answer == self.final_answer
+                )
+            )
+            if same_outcome:
+                return self
+
+            raise ValueError(
+                f"Cannot change terminal task state "
+                f"from {self.status}/{self.stop_reason} "
+                f"to {status}/{stop_reason}"
+            )
+        if self.status != STATUS_RUNNING:
+            raise ValueError(f"Unknown task status: {self.status}")
+
         self.status = status
         self.stop_reason = stop_reason
         if final_answer != "":
             self.final_answer = final_answer
         return self
+    
+    def cancel(self):
+        return self.stop(STOP_REASON_USER_CANCELLED, status=STATUS_CANCELLED)
 
     def stop_step_limit(self, final_answer=""):
         return self.stop(STOP_REASON_STEP_LIMIT_REACHED, final_answer=final_answer)
@@ -176,10 +222,7 @@ class TaskState:
         return self.stop(STOP_REASON_RUNTIME_ERROR, status=STATUS_FAILED, final_answer=final_answer)
 
     def finish_success(self, final_answer):
-        self.status = STATUS_COMPLETED
-        self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
-        self.final_answer = str(final_answer)
-        return self
+        return self.stop(STOP_REASON_FINAL_ANSWER_RETURNED, status=STATUS_COMPLETED, final_answer=str(final_answer))
 
     def to_dict(self):
         # 非运行时字段也一并写盘，方便 viewer 真空读取。

@@ -15,10 +15,14 @@ import time
 import difflib
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from jsonschema import validators, ValidationError
+from referencing import Registry
+import warnings
 
 from . import memory as memorylib
 from .context_manager import ContextManager,render_tool_result_block
@@ -27,8 +31,9 @@ from .run_store import RunStore
 from .task_state import TaskState
 from .sandbox import NoSandbox
 from .models import ModelResponse, ModelProviderError
+from .mcp.routing import MCPToolRouter, compact_query
 from . import tools as toolkit
-from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, MAX_TOOL_OUTPUT, WorkspaceContext, clip, now
 from .trace import Tracer, TraceSpanProcessor, FileSpanExporter
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
@@ -137,7 +142,19 @@ class SessionStore:
     def save(self, session):
         path = self.path(session["id"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(session, indent=2, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(session, indent=2, ensure_ascii=False)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=".session-", suffix=".tmp", delete=False) as stream:
+                temporary_path = Path(stream.name)
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return path
 
     def load(self, session_id):
@@ -166,6 +183,9 @@ class Codini:
             feature_flags=None,
             sandbox=None,
             trace=None,
+            mcp_model_tools=None,
+            mcp_tool_index=None,
+            mcp_bridge=None,
     ):
         self.trace = trace
         self.model_client = model_client
@@ -199,6 +219,14 @@ class Codini:
             workspace_root = self.root
         )
         self.session["memory"] = self.memory.to_dict()
+        self.mcp_model_tools = tuple(mcp_model_tools or ())
+        self.mcp_tool_index = dict(mcp_tool_index or {})
+        self.mcp_bridge = mcp_bridge
+        self.mcp_router = MCPToolRouter(
+            self.mcp_tool_index,
+            self.mcp_model_tools,
+            config=getattr(mcp_bridge, "routing_config", None),
+        )
         self.tools = self.build_tools()
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
@@ -237,6 +265,14 @@ class Codini:
         if self.trace:
             self.trace_span_processor = TraceSpanProcessor(self.trace)
             self.tracer.register_processor(self.trace_span_processor)
+
+    def close(self):
+        """释放当前 Agent 持有的外部资源；可重复调用。"""
+        bridge = getattr(self, "mcp_bridge", None)
+        if bridge is None:
+            return
+        bridge.close()
+        self.mcp_bridge = None
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -369,8 +405,13 @@ class Codini:
                 else:
                     status = CHECKPOINT_FULL_VALID_STATUS
 
+        pending = self.unresolved_tool_calls()
+        if pending and status in {CHECKPOINT_NONE_STATUS, CHECKPOINT_FULL_VALID_STATUS}:
+            status = "tool-review-required"
         resume_state = {
             "status": status,
+            "unresolved_tool_call_ids": [item["tool_call_id"] for item in pending],
+            "tool_recovery_required": bool(pending),
             "stale_paths": stale_paths,
             "runtime_identity_mismatch_fields": mismatch_fields,
             "stale_summary_invalidations": max(
@@ -390,7 +431,7 @@ class Codini:
         将当前 checkpoint 的关键字段渲染成文字摘要 并追加到 Prompt Prefix 的末尾
         输出: 格式化后的 checkpoint 文字摘要
         """
-        checkpoint = self.checkpoint_state()
+        checkpoint = self.current_checkpoint()
         if not checkpoint:
             return ""
         lines = [
@@ -429,13 +470,42 @@ class Codini:
         del bucket[:-limit]
 
     def build_tools(self):
-        return toolkit.build_tool_registry(self)
+        tools = toolkit.build_tool_registry(self)
+
+        for name, mcp_tool in self.mcp_tool_index.items():
+            remote_name = mcp_tool["remote_name"]
+            server_name = mcp_tool["server"]
+
+            tools[name] = {
+                "schema": {},
+                "risky": bool(mcp_tool.get("risky", True)),
+                "description": (
+                    mcp_tool.get("prompt_description")
+                    or mcp_tool.get("title")
+                    or "Remote MCP tool."
+                ),
+                "max_result_chars": int(
+                    mcp_tool.get("max_result_chars", MAX_TOOL_OUTPUT)
+                ),
+                "run": (
+                    lambda args, server_name=server_name, remote_name=remote_name:
+                    self.mcp_bridge.call_tool_text(
+                        server_name,
+                        remote_name,
+                        args,
+                    )
+                ),
+            }
+
+        return tools
 
     def model_tool_definitions(self):
         """把 Codini 工具注册表转换成 Provider 无关的函数工具描述。"""
         type_names = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
         definitions = []
         for name, tool in self.tools.items():
+            if name in self.mcp_tool_index:
+                continue
             properties = {}
             required = []
             for field_name, rule in tool.get("schema", {}).items():
@@ -457,7 +527,30 @@ class Codini:
                     },
                 }
             )
+        definitions.extend(self.mcp_router.model_definitions())
         return tuple(definitions)
+
+    def search_mcp_tools(self, args):
+        query = compact_query(args.get("query", ""))
+        limit = int(args.get("limit", self.mcp_router.config["default_search_limit"]))
+        matches = self.mcp_router.search_and_activate(query, limit)
+        return json.dumps(
+            {
+                "query": query,
+                "matches": matches,
+                "activated_tools": list(self.mcp_router.active_names()),
+                "instruction": (
+                    "Call an activated tool directly when its schema is visible. "
+                    "Use mcp_describe_tool with a canonical name if more detail is needed."
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def describe_mcp_tool(self, args):
+        description = self.mcp_router.describe_and_activate(args.get("name", ""))
+        return json.dumps(description, ensure_ascii=False, sort_keys=True)
 
     def _sandbox_notes(self):
         notes = {
@@ -488,21 +581,30 @@ class Codini:
         内容包括: 系统指令、工具列表、使用样例和工作区快照
         """
         tool_lines = []
-        for name, tool in self.tools.items():
+        prompt_tools = {
+            name: tool
+            for name, tool in self.tools.items()
+            if name not in self.mcp_tool_index
+        }
+        for name, tool in prompt_tools.items():
             fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
         tool_text = "\n".join(tool_lines)
-        tool_names = ", ".join(self.tools)
-        tool_examples = "\n".join(
-            [
-                '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-                '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-                '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-                '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-            ]
-        )
+        tool_names = ", ".join(prompt_tools)
+        mcp_capability_text = self.mcp_router.capability_prompt()
+        example_items = [
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+            '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
+            '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+            '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+        ]
+        if self.mcp_router.enabled:
+            example_items.append(
+                '<tool>{"name":"mcp_search_tools","args":{"query":"current official API documentation","limit":5}}</tool>'
+            )
+        tool_examples = "\n".join(example_items)
         # 提示词
         model_name = getattr(self.model_client, "model", "unknown")
         text = textwrap.dedent(
@@ -513,7 +615,8 @@ class Codini:
 
             Rules:
             - Use your toolbelt to inspect the workspace instead of guessing. Just like Houdini relied on precise tools to resolve any lock, you must examine the facts to guide your decisions.
-            - The registered action tools are exactly: {tool_names}.
+            - The always-visible action tools are: {tool_names}.
+            - Additional MCP tools may be selected per request and supplied through native tool definitions. Never invent their names; discover them with mcp_search_tools.
             - <tool> and <final> are output-protocol envelopes, not tool names or agent capabilities.
             - When the user asks which tools are available, list only the registered action tools. Never present <final> as a tool, action, or capability.
             - Return exactly one <tool>...</tool> or one <final>...</final>.
@@ -541,8 +644,10 @@ class Codini:
             Sandbox: shell commands run inside a {sandbox_name} sandbox.
             {sandbox_notes}
 
-            Registered action tools (exhaustive):
+            Always-visible action tools:
             {tool_text}
+
+            {mcp_capability_text}
 
             Tool-call examples:
             {tool_examples}
@@ -558,6 +663,7 @@ class Codini:
             tool_names=tool_names,
             tool_text=tool_text,
             tool_examples=tool_examples,
+            mcp_capability_text=mcp_capability_text,
             workspace_text=self.workspace.text(),
             sandbox_name=self.sandbox.name,
             sandbox_notes=self._sandbox_notes(),
@@ -652,8 +758,136 @@ class Codini:
         return prompt
 
     def record(self, item):
-        self.session["history"].append(item)
-        self.session_path = self.session_store.save(self.session)
+        history = self.session["history"]
+        call_id = item.get("tool_call_id")
+        existing = next((entry for entry in history if call_id and entry.get("tool_call_id") == call_id), None)
+        previous = dict(existing) if existing is not None else None
+        if existing is None:
+            existing = dict(item)
+            history.append(existing)
+        else:
+            existing.update(item)
+        try:
+            self.session_path = self.session_store.save(self.session)
+        except BaseException:
+            if previous is None:
+                history.pop()
+            else:
+                existing.clear()
+                existing.update(previous)
+            raise
+        return existing
+
+    def unresolved_tool_calls(self):
+        # These entries survive prompt compression; history is the durable journal.
+        return [entry for entry in self.session["history"]
+                if entry.get("role") == "tool" and entry.get("tool_call_id")
+                and entry.get("risky") and not entry.get("resolution")
+                and (entry.get("status") == "started" or entry.get("requires_review"))]
+
+    def render_tool_recovery_text(self):
+        pending = self.unresolved_tool_calls()
+        if not pending:
+            return ""
+        lines = ["Tool recovery constraints (runtime):",
+                 "Previous potentially mutating calls have unverified outcomes. Cancellation is not rollback.",
+                 "Only read-only investigation is allowed. Do not retry or replace them with another write tool.",
+                 "Report the evidence to the user; only the user can resolve these records via /resolve-tool."]
+        for entry in pending[:5]:
+            cleanup = entry.get("cleanup_report", {})
+            lines.append(f"- {entry['tool_call_id']} {entry['name']}: status={entry['status']}; "
+                         f"local_cleanup_confirmed={cleanup.get('local_cleanup_confirmed', False)}; "
+                         f"remote_outcome={cleanup.get('remote_outcome', 'unknown' if entry.get('is_mcp') else 'not-applicable')}; "
+                         f"args={clip(json.dumps(entry['args'], ensure_ascii=False), 250)}")
+        if len(pending) > 5:
+            lines.append(f"- {len(pending) - 5} additional unresolved calls; use /resolve-tool to list all.")
+        return "\n".join(lines)
+
+    def resolve_interrupted_tool(self, call_id, outcome, evidence):
+        """User-only CLI action; never register this as a model tool."""
+        if outcome not in {"completed", "not-applied", "partial"} or not str(evidence).strip():
+            raise ValueError("Provide completed|not-applied|partial and evidence that execution stopped and the outcome was checked.")
+        task = getattr(self, "current_task_state", None)
+        if task is not None and not task.is_terminal:
+            raise ValueError("Cannot resolve a tool while a run is active")
+        entry = next((item for item in self.unresolved_tool_calls() if item["tool_call_id"] == call_id), None)
+        if entry is None:
+            raise ValueError("Unknown or already resolved tool call")
+        resolution = self.redact_artifact({"source": "user", "outcome": outcome,
+                                          "evidence": str(evidence).strip(), "created_at": now()})
+        self.record({"tool_call_id": call_id, "requires_review": False, "resolution": resolution,
+                     "content": entry["content"] + "\nUser verified stopped execution: "
+                         + json.dumps(resolution, ensure_ascii=False)})
+        return resolution
+
+    def _finish_tool_call(self, entry, status, content, *, requires_review=False, cleanup_report=None, **details):
+        updated = self.record(self.redact_artifact({
+            "tool_call_id": entry["tool_call_id"], "status": status,
+            "content": content, "requires_review": requires_review,
+            "cleanup_report": cleanup_report or {}, "finished_at": now(), **details,
+        }))
+        span = self.tracer.get_current_span()
+        if span is not None and span.name.startswith("tool."):
+            span.set_attributes({key: updated.get(key) for key in (
+                "tool_call_id", "cleanup_report", "result_known", "requires_review",
+                "workspace_observation_stable",
+            )})
+        return updated
+
+    def _record_tool_interruption(self, entry, exc, before_snapshot, result=None):
+        known = result is not None
+        cleanup = dict(getattr(exc, "cleanup_report", {}) or {})
+        if not cleanup:
+            cleanup["local_cleanup_confirmed"] = entry["name"] in {"write_file", "patch_file"}
+        if entry.get("is_mcp") and not known:
+            cleanup.setdefault("remote_outcome", "unknown")
+        if isinstance(exc, KeyboardInterrupt):
+            exc.cleanup_report = cleanup
+        stable = known or (cleanup.get("local_cleanup_confirmed") is True
+                           and cleanup.get("remote_outcome") != "unknown")
+        metadata = {
+            "tool_call_id": entry["tool_call_id"],
+            "tool_status": "interrupted" if isinstance(exc, KeyboardInterrupt) else "error",
+            "tool_error_code": "user_cancelled" if isinstance(exc, KeyboardInterrupt) else "tool_failed",
+            "risk_level": "high" if entry["risky"] else "low",
+            "read_only": not entry["risky"], "approval_policy": self.approval_policy, "approved": True,
+            "security_event_type": "",
+            "cleanup_report": self.redact_artifact(cleanup), "result_known": known,
+            "workspace_observation_stable": stable, "workspace_changed": None,
+            "affected_paths": [], "diff_summary": [], "diffs": [],
+        }
+        if stable and entry["risky"]:
+            try:
+                after = self.capture_workspace_snapshot()
+                paths, summary = self.diff_workspace_snapshots(before_snapshot, after)
+                metadata.update(affected_paths=paths, diff_summary=summary, workspace_changed=bool(paths))
+                for path in paths:
+                    self.memory.invalidate_file_summary(self.memory.canonical_path(path))
+            except (Exception, KeyboardInterrupt) as observation_error:
+                metadata["workspace_observation_stable"] = False
+                metadata["observation_error"] = self.redact_text(str(observation_error))
+        self._last_tool_result_metadata = metadata
+        if known:
+            content = clip(str(result), int(self.tools[entry["name"]].get("max_result_chars", MAX_TOOL_OUTPUT)))
+            content += "\nTool result was returned before runtime bookkeeping was interrupted."
+        else:
+            content = "Tool execution was interrupted or failed; outcome is unknown. Cancellation is not rollback."
+        if str(exc):
+            content += "\n" + self.redact_text(str(exc))
+        span = self.tracer.get_current_span()
+        if span is not None and span.name.startswith("tool."):
+            span.set_attributes(self.redact_artifact({**metadata, "result": clip(content, 800),
+                                                      "result_full": clip(content, 2000)}))
+        self._finish_tool_call(
+            entry, "returned" if known else metadata["tool_status"], content,
+            requires_review=bool(entry["risky"] and (not known or (
+                entry["name"] == "run_shell" and re.search(r"exit_code:\s*-1\b", str(result))
+            ))),
+            cleanup_report=cleanup, result_known=known,
+            affected_paths=metadata["affected_paths"], diff_summary=metadata["diff_summary"],
+            workspace_observation_stable=metadata["workspace_observation_stable"],
+        )
+        return content
 
     def build_error_info(self, error, stop_reason=""):
         if isinstance(error, ModelProviderError):
@@ -854,10 +1088,11 @@ class Codini:
             {
                 "prefix_chars": len(self.prefix),
                 "workspace_chars": len(self.workspace.text()),
-                "memory_chars": len(self.memory_text()),
+                "working_memory_chars": len(self.memory_text()),
                 "history_chars": len(self.history_text()),
                 "request_chars": len(user_message),
                 "tool_count": len(self.tools),
+                "model_tool_count": len(self.model_tool_definitions()),
                 "workspace_docs": len(self.workspace.project_docs),
                 "recent_commits": len(self.workspace.recent_commits),
                 "prefix_hash": self.prefix_state.hash,
@@ -875,6 +1110,7 @@ class Codini:
                 "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
             }
         )
+        metadata.update(self.mcp_router.metadata())
         metadata.update(self.detected_secret_env_summary())
         return prompt, metadata
 
@@ -1120,7 +1356,13 @@ class Codini:
         checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
         key_files = []
         freshness = {}
-        for path in self.memory.to_dict()["working"]["recent_files"]:
+        pending = self.unresolved_tool_calls()
+        stable = all(item.get("cleanup_report", {}).get("local_cleanup_confirmed") is True
+                     and item.get("workspace_observation_stable") is not False
+                     and item.get("cleanup_report", {}).get("remote_outcome") != "unknown"
+                     for item in pending)
+        recent_files = self.memory.to_dict()["working"]["recent_files"] if stable else []
+        for path in recent_files:
             file_freshness = memorylib.file_freshness(path, self.root)
             freshness[path] = file_freshness
             key_files.append({"path": path, "freshness": file_freshness})
@@ -1136,6 +1378,8 @@ class Codini:
             "next_step": self.infer_next_step(task_state),
             "key_files": key_files,
             "freshness": freshness,
+            "workspace_observation_stable": stable,
+            "unresolved_tool_call_ids": [item["tool_call_id"] for item in pending],
             "summary": f"{trigger}: {clip(str(user_message), 120)}",
             "runtime_identity": self.current_runtime_identity()
         }
@@ -1147,6 +1391,8 @@ class Codini:
         return checkpoint
 
     def infer_next_step(self, task_state):
+        if self.unresolved_tool_calls():
+            return "Use read-only checks to verify interrupted operations; ask the user to resolve them before any write."
         if task_state.status == "completed":
             return "No next step recorded."
         if task_state.stop_reason == "step_limit_reached":
@@ -1397,6 +1643,7 @@ class Codini:
         run_started_at = time.monotonic()
         self._trace_started_at = run_started_at
         self._response_corrections = []
+        self.mcp_router.begin_request(user_message)
         self.memory.set_task_summary(user_message)
         self.capture_user_typed_note(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
@@ -1473,6 +1720,8 @@ class Codini:
             "soft_step_limit": step_budget.soft_limit,
             "hard_step_limit": step_budget.hard_limit,
         })
+        if self.mcp_router.enabled:
+            run_span.add_event("mcp_tools_routed", self.mcp_router.metadata())
         run_span_token = self.tracer._active_span_var.set(run_span)
 
         tool_steps = 0
@@ -1924,8 +2173,10 @@ class Codini:
                             {
                                 "role": "tool",
                                 "name": name,
-                                "args": args,
-                                "content": recorded_result,
+                                "args": self.redact_artifact(args),
+                                "content": self.redact_text(recorded_result),
+                                "tool_call_id": tool_result_meta.get("tool_call_id"),
+                                "status": tool_status,
                                 "created_at": now(),
                             }
                         )
@@ -1995,15 +2246,9 @@ class Codini:
                 if kind == "retry":
                     correction_payload = dict(payload or {})
                     invalid_signature = str(correction_payload.get("signature", ""))
-                    error_type = str(
-                        correction_payload.get("error_type", "format_error")
-                    )
-                    problem = str(
-                        correction_payload.get("problem", "invalid model response")
-                    )
-                    correction = str(
-                        correction_payload.get("message") or self.retry_notice(problem)
-                    )
+                    error_type = str(correction_payload.get("error_type", "format_error"))
+                    problem = str(correction_payload.get("problem", "invalid model response"))
+                    correction = str(correction_payload.get("message") or self.retry_notice(problem))
                     if invalid_signature == last_invalid_response_signature:
                         repeated_invalid_response_count += 1
                     else:
@@ -2050,6 +2295,7 @@ class Codini:
                         response_retry_limit_reached = True
                         break
                     continue
+
                 final = (payload or raw).strip()
                 self.record({"role": "assistant", "content": final, "created_at": now()})
                 task_state.finish_success(final)
@@ -2204,6 +2450,83 @@ class Codini:
             )
             run_span.finish()
             return final
+        except KeyboardInterrupt as exc:
+            pending_error = exc
+            if not task_state.is_terminal:
+                task_state.cancel()
+            run_span.set_attributes({
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                "final_answer": task_state.final_answer,
+                "interrupted": True,
+            })
+            run_span.add_event("user_interrupted", {
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                # Local resource cleanup and remote execution are separate facts.
+                "cleanup_report": self.redact_artifact(getattr(exc, "cleanup_report", {})),
+                "cleanup_confirmed": bool(getattr(exc, "cleanup_report", {}).get("local_cleanup_confirmed"))
+                    and getattr(exc, "cleanup_report", {}).get("remote_outcome") != "unknown",
+            })
+
+            try:
+                # 先保存最重要的终态，避免后续 checkpoint 生成失败导致磁盘上仍然显示 running。
+                self.run_store.write_task_state(
+                    task_state,
+                    trigger="user_interrupted",
+                    related_span_id=run_span.span_id,
+                    related_event="user_interrupted",
+                )
+
+                # 已完成的运行不需要因收尾中断而重建 checkpoint。
+                if task_state.status == "cancelled":
+                    checkpoint = self.create_checkpoint(
+                        task_state,
+                        user_message,
+                        trigger="user_interrupted",
+                    )
+                    run_span.add_event("checkpoint_created", {
+                        "checkpoint_id": checkpoint["checkpoint_id"],
+                        "trigger": "user_interrupted",
+                    })
+
+                    # create_checkpoint 会更新 checkpoint_id，因此再次保存，保持两份记录一致。
+                    self.run_store.write_task_state(
+                        task_state,
+                        trigger="checkpoint_created",
+                        related_span_id=run_span.span_id,
+                        related_event="checkpoint_created",
+                    )
+
+                self.record_run_summary(
+                    task_state,
+                    write_task_state=False,
+                    trigger="user_interrupted",
+                    related_span_id=run_span.span_id,
+                    related_event="user_interrupted",
+                )
+                self.run_store.write_report(
+                    task_state,
+                    self.redact_artifact(self.build_report(task_state)),
+                    trigger="user_interrupted",
+                    related_span_id=run_span.span_id,
+                    related_event="user_interrupted",
+                )
+
+            except Exception as persistence_error:
+                run_span.add_event("cancellation_persistence_failed", {
+                    "message": self.redact_text(str(persistence_error)),
+                })
+                warnings.warn(
+                    "本轮控制流程已中断，但运行状态未完整保存；"
+                    "恢复时需要检查最近一次操作的结果。",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            finally:
+                # 把原始中断交还给 CLI；即使保存失败，也不能把 Ctrl+C 变成另一个普通运行错误。
+                raise exc
+
         except Exception as exc:
             pending_error = exc
             if getattr(task_state, "stop_reason", "") == "":
@@ -2248,7 +2571,14 @@ class Codini:
             raise
         finally:
             if run_span.end_time is None:
-                run_span.finish(status="ERROR" if pending_error else "OK")
+                if isinstance(pending_error, KeyboardInterrupt):
+                    span_status = "CANCELLED"
+                elif pending_error is not None:
+                    span_status = "ERROR"
+                else:
+                    span_status = "OK"
+                run_span.finish(status=span_status)
+
             if run_span_token is not None:
                 self.tracer._active_span_var.reset(run_span_token)
             self.tracer.unregister_processor(self.span_exporter)
@@ -2275,6 +2605,21 @@ class Codini:
                 "diff_summary": [],
             }
             return f"error: unknown tool '{name}'"
+        if name in self.mcp_tool_index and not self.mcp_router.is_active(name):
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "mcp_tool_not_exposed",
+                "security_event_type": "tool_exposure_boundary",
+                "risk_level": "high" if tool["risky"] else "low",
+                "read_only": not tool["risky"],
+                "affected_paths": [],
+                "workspace_changed": False,
+                "diff_summary": [],
+            }
+            return (
+                f"error: MCP tool '{name}' is not active for this request; "
+                "use mcp_search_tools to discover and activate it"
+            )
         try:
             self.validate_tool(name,args)
         except Exception as e:
@@ -2294,6 +2639,18 @@ class Codini:
                 "diff_summary": [],
             }
             return message
+
+        pending = self.unresolved_tool_calls()
+        if pending and tool["risky"] and name != "delegate":
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected", "tool_error_code": "tool_recovery_required",
+                "security_event_type": "tool_recovery_boundary", "workspace_changed": False,
+                "affected_paths": [], "diff_summary": [],
+                "unresolved_tool_call_ids": [item["tool_call_id"] for item in pending],
+            }
+            return ("error: unresolved tool execution; only read-only investigation is allowed. "
+                    "The user must verify execution stopped and resolve the outcome via /resolve-tool. "
+                    "Blocked calls: " + ", ".join(item["tool_call_id"] for item in pending))
 
         if self.repeated_tool_call(name, args):
             self._last_tool_result_metadata = {
@@ -2359,10 +2716,29 @@ class Codini:
 
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
+        task = getattr(self, "current_task_state", None)
+        entry = self.record(self.redact_artifact({
+            "role": "tool", "name": name, "args": args, "created_at": now(),
+            "tool_call_id": "tool_" + uuid.uuid4().hex[:12],
+            "run_id": task.run_id if task else "", "span_id": getattr(self, "current_tool_span_id", ""),
+            "risky": bool(tool["risky"]), "is_mcp": name in self.mcp_tool_index,
+            "args_fingerprint": hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+            "status": "started", "requires_review": bool(tool["risky"]),
+            "content": "Tool invocation prepared; no outcome recorded. It may have executed; verify before retrying.",
+        }))
+        tool_started_at = time.monotonic()
+        result = None
         try:
             if name == "delegate":
                 self._last_delegate_child_info = {}
-            result = clip(tool["run"](args))
+            result_limit = int(tool.get("max_result_chars", MAX_TOOL_OUTPUT))
+            result = tool["run"](args)
+            result = clip(result, limit=result_limit)
+            timed_out = name == "run_shell" and bool(re.search(r"exit_code:\s*-1\b", result))
+            self._finish_tool_call(entry, "returned", result, requires_review=timed_out, result_known=True,
+                                   cleanup_report={"local_cleanup_confirmed": True} if timed_out else {})
+            if name in self.mcp_tool_index:
+                self.mcp_router.mark_used(name)
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -2398,39 +2774,41 @@ class Codini:
                 "diffs": diffs,
                 **child_info,
             }
+            self._last_tool_result_metadata["tool_call_id"] = entry["tool_call_id"]
+            self._finish_tool_call(entry, tool_status, result, requires_review=entry.get("requires_review", False),
+                                   cleanup_report=entry.get("cleanup_report"), result_known=True,
+                                   affected_paths=affected_paths, diff_summary=diff_summary)
             self.record_process_note_for_tool(name, self._last_tool_result_metadata, args)
             return result
+        except KeyboardInterrupt as exc:
+            try:
+                self._record_tool_interruption(entry, exc, before_snapshot, result)
+            except (Exception, KeyboardInterrupt) as persistence_error:
+                # The previously saved started record remains the recovery barrier.
+                warnings.warn("Interrupted tool outcome could not be fully saved: "
+                              + self.redact_text(str(persistence_error)), RuntimeWarning)
+            if task is not None:
+                task.record_tool(name)
+                self._accum_tool(name, duration_ms=int((time.monotonic() - tool_started_at) * 1000))
+            raise
         except Exception as exc:
-            after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
-            affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
-            workspace_changed = bool(affected_paths)
-            diffs = self._generate_diffs(affected_paths, before_snapshot, after_snapshot, rel_target_path, before_content)
-            security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            self._last_tool_result_metadata = {
-                "tool_status": "partial_success" if workspace_changed else "error",
-                "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
-                "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
-                "approval_policy": self.approval_policy,
-                "approved": approved,
-                "read_only": not tool["risky"],
-                "affected_paths": affected_paths,
-                "workspace_changed": workspace_changed,
-                "workspace_fingerprint": self.workspace.fingerprint(),
-                "diff_summary": diff_summary,
-                "diffs": diffs,
-            }
+            content = self._record_tool_interruption(entry, exc, before_snapshot, result)
             self.record_process_note_for_tool(name, self._last_tool_result_metadata, args)
-            return f"error: tool {name} failed: {exc}"
+            return content
 
     def repeated_tool_call(self, name, args):
         """ 检测最近两次工具调用是否完全相同"""
         # Agent 很常见的一种死循环 即在没有新信息的情况下反复发起同一调用
-        tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
+        tool_events = [item for item in self.session["history"] if item["role"] == "tool"
+                       and item.get("status") not in {"rejected", "started", "interrupted"}
+                       and not item.get("resolution")]
         if len(tool_events) < 2:
             return False
         recent = tool_events[-2:]
-        return all(item["name"] == name and item["args"] == args for item in recent)
+        fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        return all(item["name"] == name and (
+            item.get("args_fingerprint") == fingerprint if item.get("args_fingerprint") else item["args"] == args
+        ) for item in recent)
 
     @staticmethod
     def new_task_id():
@@ -2460,6 +2838,7 @@ class Codini:
             "prompt_metadata": self.last_prompt_metadata,
             "error": dict(getattr(task_state, "error", {}) or {}),
             "response_corrections": list(self._response_corrections[-10:]),
+            "unresolved_tool_calls": self.redact_artifact(self.unresolved_tool_calls()),
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
@@ -2474,6 +2853,20 @@ class Codini:
         if name not in self.tools:
             raise toolkit.ToolSchemaError(f"unknown or unavailable tool: {name}")
         toolkit.validate_tool_schema(name, args)
+        mcp_tool = getattr(self, "mcp_tool_index", {}).get(name)
+        if mcp_tool is not None:
+            schema = mcp_tool.get("input_schema")
+            if schema is None:
+                schema = {"type": "object"}
+            try:
+                validator_type = validators.validator_for(schema)
+                validator_type.check_schema(schema)
+                validator_type(schema, registry=Registry()).validate(args)
+            except ValidationError as exc:
+                location = ".".join(str(part) for part in exc.absolute_path) or "args"
+                raise toolkit.ToolSchemaError(f"{location}: {exc.message}") from exc
+            except Exception as exc:
+                raise toolkit.ToolSchemaError(f"Cannot validate MCP tool schema: {exc}") from exc
 
     def validate_tool_state(self, name, args):
         """功能：校验工具请求所需的工作区状态；输入：工具名和参数；输出：无。"""
@@ -2521,7 +2914,7 @@ class Codini:
         return answer.strip().lower() in {"y", "yes"}
 
     @staticmethod
-    def parse(raw):
+    def parse(raw, extra_tools=None, allowed_mcp_tools=None):
         """把模型原始输出解析成 runtime 可执行的动作或最终答案。
 
         为什么存在：
@@ -2551,11 +2944,21 @@ class Codini:
                     "model returned malformed tool JSON",
                     raw=raw,
                 )
-            return Codini.parsed_tool_result(payload, raw=raw)
+            return Codini.parsed_tool_result(
+                payload,
+                raw=raw,
+                extra_tools=extra_tools,
+                allowed_mcp_tools=allowed_mcp_tools,
+            )
         if "<tool" in raw and "<tool_result" not in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Codini.parse_xml_tool(raw)
             if payload is not None:
-                return Codini.parsed_tool_result(payload, raw=raw)
+                return Codini.parsed_tool_result(
+                    payload,
+                    raw=raw,
+                    extra_tools=extra_tools,
+                    allowed_mcp_tools=allowed_mcp_tools,
+                )
             return "retry", Codini.response_correction(
                 "format_error",
                 "model returned malformed XML tool output",
@@ -2579,11 +2982,15 @@ class Codini:
             raw=raw,
         )
 
-    @staticmethod
-    def parse_model_response(response):
+    def parse_model_response(self, response):
         """消费 Provider 归一化的响应；原始文本仅作为兼容 fallback。"""
+        allowed_mcp_tools = set(self.mcp_router.active_names())
         if not isinstance(response, ModelResponse):
-            return Codini.parse(response)
+            return Codini.parse(
+                response,
+                extra_tools=self.mcp_tool_index,
+                allowed_mcp_tools=allowed_mcp_tools,
+            )
         if response.tool_calls:
             if len(response.tool_calls) > 1:
                 return "retry", Codini.response_correction(
@@ -2595,12 +3002,24 @@ class Codini:
             return Codini.parsed_tool_result(
                 {"name": call.name, "args": call.arguments_dict()},
                 raw=response.trace_text(),
+                extra_tools=self.mcp_tool_index,
+                allowed_mcp_tools=allowed_mcp_tools,
             )
-        return Codini.parse(response.assistant_text)
+        return Codini.parse(
+            response.assistant_text,
+            extra_tools=self.mcp_tool_index,
+            allowed_mcp_tools=allowed_mcp_tools,
+        )
 
     @staticmethod
-    def parsed_tool_result(payload, raw=""):
+    def parsed_tool_result(
+        payload,
+        raw="",
+        extra_tools=None,
+        allowed_mcp_tools=None,
+    ):
         """功能：统一校验三种工具协议；输入：解析后的工具载荷；输出：tool 或 retry 决策。"""
+        extra_tools = extra_tools or {}
         if not isinstance(payload, dict):
             return "retry", Codini.response_correction(
                 "schema_error",
@@ -2616,7 +3035,8 @@ class Codini:
                 parsed=payload,
             )
         spec = toolkit.BASE_TOOL_SPECS.get(name)
-        if spec is None:
+        is_mcp_tool = name in extra_tools
+        if spec is None and not is_mcp_tool:
             return "retry", Codini.response_correction(
                 "schema_error",
                 f"unknown tool: {name}",
@@ -2634,6 +3054,16 @@ class Codini:
                 raw=raw,
                 parsed=payload,
             )
+
+        if is_mcp_tool:
+            if allowed_mcp_tools is not None and name not in allowed_mcp_tools:
+                return "retry", Codini.response_correction(
+                    "tool_policy_error",
+                    f"MCP tool is not active for this request: {name}; use mcp_search_tools first",
+                    raw=raw,
+                    parsed=payload,
+                )
+            return "tool", {"name": name, "args": args}
 
         schema = spec.get("schema", {})
         required_fields = [
@@ -2834,6 +3264,8 @@ class Codini:
 
     def reset(self):
         """ 重置 Agent 状态 """
+        if self.unresolved_tool_calls():
+            raise ValueError("Resolve interrupted tool calls with /resolve-tool before resetting the session")
         self.session["history"] = []
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())

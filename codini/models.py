@@ -3,11 +3,13 @@ from enum import Enum
 from http.client import RemoteDisconnected
 import json
 import re
-import threading
+import asyncio
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
+
+import httpx
 
 
 @dataclass(frozen=True)
@@ -268,6 +270,9 @@ def normalize_provider_error(error, provider=""):
             body = error.read().decode("utf-8", errors="replace")
         except Exception:
             body = ""
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        body = error.response.text
     payload, body_text = _body_payload(body)
     message = str(payload.get("message") or payload.get("detail") or body_text or error)
     code = payload.get("code") or payload.get("type") or ""
@@ -305,6 +310,7 @@ def normalize_provider_error(error, provider=""):
             error,
             (
                 urllib.error.URLError,
+                httpx.RequestError,
                 TimeoutError,
                 ConnectionRefusedError,
                 RemoteDisconnected,
@@ -497,28 +503,53 @@ def parse_provider_text_tool_calls(
     return ()
 
 
-def _urlopen_interruptible(request, timeout):
-    """urlopen wrapped in a thread so KeyboardInterrupt can escape the blocking socket call on Windows."""
-    result = [None]
-    error = [None]
-    done = threading.Event()
+def _http_request_interruptible(request, timeout):
+    """Run cancellable HTTP I/O; return only after the request and client close."""
+    report = {"resource": "model_http", "local_cleanup_confirmed": False,
+              "remote_outcome": "unknown"}
 
-    def _worker():
+    async def fetch():
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        task = None
+        cancelled = False
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
-                result[0] = (resp.read().decode("utf-8"), dict(resp.headers))
-        except Exception as exc:
-            error[0] = exc
+            task = asyncio.create_task(client.request(
+                request.get_method(), request.full_url,
+                headers=dict(request.header_items()), content=request.data,
+            ))
+            # Keep Windows' event loop responsive to console Ctrl+C too.
+            while not task.done():
+                await asyncio.wait({task}, timeout=0.1)
+            response = await task
+            response.raise_for_status()
+            return response.content.decode("utf-8"), response.headers
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            done.set()
+            try:
+                try:
+                    if task is not None:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                finally:
+                    await client.aclose()
+            except Exception as exc:
+                report.setdefault("cleanup_errors", []).append(str(exc))
+                if not cancelled:
+                    raise
+            else:
+                report["local_cleanup_confirmed"] = True
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    while not done.wait(timeout=0.1):
-        pass  # allows KeyboardInterrupt to propagate from main thread
-    if error[0] is not None:
-        raise error[0]
-    return result[0]  # (body_text, headers_dict)
+    async def run():
+        return await asyncio.wait_for(fetch(), timeout=timeout)
+
+    try:
+        return asyncio.run(run())
+    except KeyboardInterrupt as exc:
+        exc.cleanup_report = report
+        raise
 
 
 def _normalize_versioned_base_url(base_url):
@@ -954,7 +985,7 @@ class OllamaModelClient(_ModelClientBase):
             data=json.dumps(payload).encode("utf-8"),
         )
         body_text, _ = execute_with_retry(
-            lambda timeout: _urlopen_interruptible(http_request, timeout),
+            lambda timeout: _http_request_interruptible(http_request, timeout),
             provider="ollama",
             timeout=self.timeout,
         )
@@ -1024,7 +1055,7 @@ class _OpenAICompatibleModelClient(_ModelClientBase):
             data=json.dumps(payload).encode("utf-8"),
         )
         body_text, response_headers = execute_with_retry(
-            lambda timeout: _urlopen_interruptible(http_request, timeout),
+            lambda timeout: _http_request_interruptible(http_request, timeout),
             provider=self.provider_name,
             timeout=self.timeout,
         )
@@ -1136,7 +1167,7 @@ class AnthropicCompatibleModelClient(_ModelClientBase):
             data=json.dumps(payload).encode("utf-8"),
         )
         body_text, response_headers = execute_with_retry(
-            lambda timeout: _urlopen_interruptible(http_request, timeout),
+            lambda timeout: _http_request_interruptible(http_request, timeout),
             provider=self.provider_name,
             timeout=self.timeout,
         )
